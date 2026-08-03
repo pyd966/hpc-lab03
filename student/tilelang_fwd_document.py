@@ -1,11 +1,15 @@
-# Residual-first baseline: Z = A @ (beta * (V - exp(g) * K @ S)).
-import os
+"""Document-form baseline retained for comparison and profiling.
+
+This follows the lab equations literally:
+    W = A @ (beta * exp(g) * K)
+    U = A @ (beta * V)
+    Z = U - W @ S
+Set GDN_IMPL=document before importing student.tilelang_fwd to select it.
+"""
 
 import torch
 import tilelang
 import tilelang.language as T
-
-from student.tilelang_fwd_document import gdn_prefill_forward_document
 
 
 CHUNK_SIZE = 64
@@ -13,7 +17,6 @@ HEAD_DIM_K = 128
 HEAD_DIM_V = 128
 LOG2E = 1.4426950408889634
 SCALE = HEAD_DIM_K**-0.5
-USE_DOCUMENT_FORM = os.environ.get("GDN_IMPL", "residual") == "document"
 
 
 @tilelang.jit(
@@ -21,7 +24,84 @@ USE_DOCUMENT_FORM = os.environ.get("GDN_IMPL", "residual") == "document"
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
     },
 )
-def tilelang_residual_first(
+def tilelang_prepare_w_u(H, Hg, qk_dtype, v_dtype, gate_dtype, accum_dtype):
+    batch_size = T.dynamic("batch_size")
+    num_tokens = T.dynamic("num_tokens")
+    k_shape = (batch_size, num_tokens, Hg, HEAD_DIM_K)
+    v_shape = (batch_size, num_tokens, H, HEAD_DIM_V)
+    gate_shape = (batch_size, num_tokens, H)
+    a_shape = (batch_size, num_tokens, H, CHUNK_SIZE)
+    wu_shape = (batch_size, num_tokens, H, HEAD_DIM_V)
+
+    @T.prim_func
+    def kernel(
+        k: T.Tensor(k_shape, dtype=qk_dtype),
+        v: T.Tensor(v_shape, dtype=v_dtype),
+        g: T.Tensor(gate_shape, dtype=gate_dtype),
+        beta: T.Tensor(gate_shape, dtype=gate_dtype),
+        a: T.Tensor(a_shape, dtype=qk_dtype),
+        w: T.Tensor(wu_shape, dtype=qk_dtype),
+        u: T.Tensor(wu_shape, dtype=v_dtype),
+        total_chunks: T.int32,
+    ):
+        with T.Kernel(total_chunks * H, threads=128) as (block,):
+            chunk = block // H
+            bh = block % H
+            bb = chunk % batch_size
+            local_chunk = chunk // batch_size
+            bhg = bh // (H // Hg)
+            left = local_chunk * CHUNK_SIZE
+
+            a_shared = T.alloc_shared((CHUNK_SIZE, CHUNK_SIZE), dtype=qk_dtype)
+            operand_shared = T.alloc_shared(
+                (CHUNK_SIZE, HEAD_DIM_K), dtype=qk_dtype
+            )
+            result = T.alloc_fragment(
+                (CHUNK_SIZE, HEAD_DIM_V), dtype=accum_dtype
+            )
+
+            for row, col in T.Parallel(CHUNK_SIZE, CHUNK_SIZE):
+                if left + row < num_tokens:
+                    a_shared[row, col] = a[bb, left + row, bh, col]
+                else:
+                    a_shared[row, col] = 0
+
+            for token, dim in T.Parallel(CHUNK_SIZE, HEAD_DIM_K):
+                if left + token < num_tokens:
+                    operand_shared[token, dim] = (
+                        k[bb, left + token, bhg, dim]
+                        * beta[bb, left + token, bh]
+                        * T.exp2(g[bb, left + token, bh] * LOG2E)
+                    )
+                else:
+                    operand_shared[token, dim] = 0
+            T.gemm(a_shared, operand_shared, result, clear_accum=True)
+            for token, dim in T.Parallel(CHUNK_SIZE, HEAD_DIM_K):
+                if left + token < num_tokens:
+                    w[bb, left + token, bh, dim] = result[token, dim]
+
+            for token, dim in T.Parallel(CHUNK_SIZE, HEAD_DIM_V):
+                if left + token < num_tokens:
+                    operand_shared[token, dim] = (
+                        v[bb, left + token, bh, dim]
+                        * beta[bb, left + token, bh]
+                    )
+                else:
+                    operand_shared[token, dim] = 0
+            T.gemm(a_shared, operand_shared, result, clear_accum=True)
+            for token, dim in T.Parallel(CHUNK_SIZE, HEAD_DIM_V):
+                if left + token < num_tokens:
+                    u[bb, left + token, bh, dim] = result[token, dim]
+
+    return kernel
+
+
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    },
+)
+def tilelang_document_output_and_state(
     H,
     Hg,
     qk_dtype,
@@ -35,7 +115,6 @@ def tilelang_residual_first(
     qk_shape = (batch_size, num_tokens, Hg, HEAD_DIM_K)
     v_shape = (batch_size, num_tokens, H, HEAD_DIM_V)
     gate_shape = (batch_size, num_tokens, H)
-    a_shape = (batch_size, num_tokens, H, CHUNK_SIZE)
     state_shape = (batch_size, H, HEAD_DIM_K, HEAD_DIM_V)
     initial_shape = state_shape if use_initial_state else (1,)
 
@@ -43,16 +122,14 @@ def tilelang_residual_first(
     def kernel(
         q: T.Tensor(qk_shape, dtype=qk_dtype),
         k: T.Tensor(qk_shape, dtype=qk_dtype),
-        v: T.Tensor(v_shape, dtype=v_dtype),
         g: T.Tensor(gate_shape, dtype=gate_dtype),
-        beta: T.Tensor(gate_shape, dtype=gate_dtype),
-        a: T.Tensor(a_shape, dtype=qk_dtype),
+        w: T.Tensor(v_shape, dtype=qk_dtype),
+        u: T.Tensor(v_shape, dtype=v_dtype),
         initial_state: T.Tensor(initial_shape, dtype=accum_dtype),
         output: T.Tensor(v_shape, dtype=v_dtype),
         final_state: T.Tensor(state_shape, dtype=accum_dtype),
         chunks_per_batch: T.int32,
     ):
-        # One block owns one recurrent state; chunks must be traversed serially.
         with T.Kernel(batch_size * H, threads=256) as (block,):
             bb = block // H
             bh = block % H
@@ -60,8 +137,7 @@ def tilelang_residual_first(
 
             q_shared = T.alloc_shared((CHUNK_SIZE, HEAD_DIM_K), dtype=qk_dtype)
             k_shared = T.alloc_shared((CHUNK_SIZE, HEAD_DIM_K), dtype=qk_dtype)
-            v_shared = T.alloc_shared((CHUNK_SIZE, HEAD_DIM_V), dtype=v_dtype)
-            a_shared = T.alloc_shared((CHUNK_SIZE, CHUNK_SIZE), dtype=qk_dtype)
+            w_shared = T.alloc_shared((CHUNK_SIZE, HEAD_DIM_K), dtype=qk_dtype)
             z_shared = T.alloc_shared((CHUNK_SIZE, HEAD_DIM_V), dtype=v_dtype)
             state_shared = T.alloc_shared(
                 (HEAD_DIM_K, HEAD_DIM_V), dtype=v_dtype
@@ -70,7 +146,6 @@ def tilelang_residual_first(
                 (CHUNK_SIZE, CHUNK_SIZE), dtype=qk_dtype
             )
             g_shared = T.alloc_shared((CHUNK_SIZE,), dtype=gate_dtype)
-            beta_shared = T.alloc_shared((CHUNK_SIZE,), dtype=gate_dtype)
             g_last = T.alloc_shared((1,), dtype=gate_dtype)
 
             state = T.alloc_fragment(
@@ -96,52 +171,35 @@ def tilelang_residual_first(
                     if left + token < num_tokens:
                         q_shared[token, dim] = q[bb, left + token, bhg, dim]
                         k_shared[token, dim] = k[bb, left + token, bhg, dim]
-                        v_shared[token, dim] = v[bb, left + token, bh, dim]
+                        w_shared[token, dim] = w[bb, left + token, bh, dim]
                     else:
                         q_shared[token, dim] = 0
                         k_shared[token, dim] = 0
-                        v_shared[token, dim] = 0
-                for row, col in T.Parallel(CHUNK_SIZE, CHUNK_SIZE):
-                    if left + row < num_tokens:
-                        a_shared[row, col] = a[bb, left + row, bh, col]
-                    else:
-                        a_shared[row, col] = 0
+                        w_shared[token, dim] = 0
                 for token in T.Parallel(CHUNK_SIZE):
                     if left + token < num_tokens:
                         g_shared[token] = g[bb, left + token, bh]
-                        beta_shared[token] = beta[bb, left + token, bh]
                     else:
                         g_shared[token] = 0
-                        beta_shared[token] = 0
                 if right <= num_tokens:
                     g_last[0] = g_shared[CHUNK_SIZE - 1]
                 else:
                     g_last[0] = g[bb, num_tokens - 1, bh]
 
-                # Residual-first form:
-                #   R = beta * (V - exp(g) * K @ S)
-                #   Z = A @ R
-                T.gemm(k_shared, state_shared, z, clear_accum=True)
+                T.gemm(w_shared, state_shared, z, clear_accum=True)
                 for token, dim in T.Parallel(CHUNK_SIZE, HEAD_DIM_V):
                     if left + token < num_tokens:
-                        z[token, dim] = beta_shared[token] * (
-                            v_shared[token, dim]
-                            - T.exp2(g_shared[token] * LOG2E) * z[token, dim]
-                        )
+                        z[token, dim] = u[bb, left + token, bh, dim] - z[token, dim]
                     else:
                         z[token, dim] = 0
                 T.copy(z, z_shared)
-                T.gemm(a_shared, z_shared, z, clear_accum=True)
-                T.copy(z, z_shared)
 
-                # Contribution from the state at the start of the chunk.
                 T.gemm(q_shared, state_shared, out, clear_accum=True)
                 for token, dim in T.Parallel(CHUNK_SIZE, HEAD_DIM_V):
                     out[token, dim] *= SCALE * T.exp2(
                         g_shared[token] * LOG2E
                     )
 
-                # Causal in-chunk contribution: tril(Q K^T * decay) @ Z.
                 T.gemm(
                     q_shared,
                     k_shared,
@@ -163,7 +221,6 @@ def tilelang_residual_first(
                     if left + token < num_tokens:
                         output[bb, left + token, bh, dim] = out[token, dim]
 
-                # S' = exp(g_last) S + K^T @ (exp(g_last-g_i) Z_i).
                 for dim_k, dim_v in T.Parallel(HEAD_DIM_K, HEAD_DIM_V):
                     state[dim_k, dim_v] *= T.exp2(g_last[0] * LOG2E)
                 for token, dim in T.Parallel(CHUNK_SIZE, HEAD_DIM_V):
@@ -184,12 +241,7 @@ def tilelang_residual_first(
     return kernel
 
 
-# q/k: [B, T, Hq, 128] BF16
-# v: [B, T, Hv, 128] BF16
-# g_cumsum/beta: [B, T, Hv] FP32
-# A: [B, T, Hv, 64] BF16
-# initial_state/final_state: [B, Hv, 128, 128] FP32
-def gdn_prefill_forward(
+def gdn_prefill_forward_document(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -198,21 +250,13 @@ def gdn_prefill_forward(
     A: torch.Tensor,
     initial_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if USE_DOCUMENT_FORM:
-        return gdn_prefill_forward_document(
-            q,
-            k,
-            v,
-            g_cumsum,
-            beta,
-            A,
-            initial_state,
-        )
-
     batch_size, num_tokens, num_heads_qk, _ = q.shape
     num_heads_v = v.shape[2]
     chunks_per_batch = tilelang.cdiv(num_tokens, CHUNK_SIZE)
+    total_chunks = batch_size * chunks_per_batch
 
+    w = torch.empty_like(v)
+    u = torch.empty_like(v)
     output = torch.empty_like(v)
     final_state = torch.empty(
         (batch_size, num_heads_v, HEAD_DIM_K, HEAD_DIM_V),
@@ -220,10 +264,20 @@ def gdn_prefill_forward(
         device=v.device,
     )
 
+    prepare = tilelang_prepare_w_u(
+        num_heads_v,
+        num_heads_qk,
+        qk_dtype=q.dtype,
+        v_dtype=v.dtype,
+        gate_dtype=g_cumsum.dtype,
+        accum_dtype="float32",
+    )
+    prepare(k, v, g_cumsum, beta, A, w, u, total_chunks)
+
     use_initial_state = initial_state is not None
     if initial_state is None:
         initial_state = torch.empty((1,), dtype=torch.float32, device=v.device)
-    recurrent = tilelang_residual_first(
+    recurrent = tilelang_document_output_and_state(
         num_heads_v,
         num_heads_qk,
         qk_dtype=q.dtype,
@@ -235,10 +289,9 @@ def gdn_prefill_forward(
     recurrent(
         q,
         k,
-        v,
         g_cumsum,
-        beta,
-        A,
+        w,
+        u,
         initial_state,
         output,
         final_state,
