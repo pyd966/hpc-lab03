@@ -1,0 +1,9 @@
+CASE               B        T   Hq   Hv  STATE  RESULT   MEDIAN (ms)
+--------------------------------------------------------------------
+2026-08-02 13:33:10  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:133): TileLang begins to compile kernel `kernel` with `out_idx=None`
+2026-08-02 13:33:16  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:141): TileLang completes to compile kernel `kernel`
+2026-08-02 13:33:18  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:133): TileLang begins to compile kernel `kernel` with `out_idx=None`
+2026-08-02 13:33:25  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:141): TileLang completes to compile kernel `kernel`
+short_tail_state   1     1025    2    8    yes    PASS         0.310
+--------------------------------------------------------------------
+All 1 case(s) passed correctness.

@@ -1,0 +1,11 @@
+==WARNING== Note: Running with unmodified GPU clocks. If not controlled otherwise, profiling results may be inconsistent.
+==PROF== Connected to process 88 (/usr/bin/python3.12)
+2026-08-03 10:34:08  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:133): TileLang begins to compile kernel `kernel` with `out_idx=None`
+2026-08-03 10:34:15  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:141): TileLang completes to compile kernel `kernel`
+2026-08-03 10:34:17  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:133): TileLang begins to compile kernel `kernel` with `out_idx=None`
+2026-08-03 10:34:24  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:141): TileLang completes to compile kernel `kernel`
+==PROF== Profiling "kernel_kernel" - 0: 0%....50%....100% - 13 passes
+==PROF== Profiling "kernel_kernel" - 1: 0%....50%....100% - 13 passes
+profiled implementation=document case=long_low_gva repetitions=1
+==PROF== Disconnected from process 88
+==PROF== Report: /home/h3250106394/lab03/output/ncu_document_long.ncu-rep

@@ -1,0 +1,10 @@
+2026-08-03 10:29:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:133): TileLang begins to compile kernel `kernel` with `out_idx=None`
+2026-08-03 10:29:50  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:141): TileLang completes to compile kernel `kernel`
+Capture range started in the application.
+Capture range ended in the application.
+Generating '/tmp/nsys-report-0584.qdstrm'
+[1/1] [0%                          ] nsys_residual_long.nsys-repProcessing events...
+[1/1] [0%                          ] nsys_residual_long.nsys-rep[1/1] [==21%                       ] nsys_residual_long.nsys-rep[1/1] [========42%                 ] nsys_residual_long.nsys-rep[1/1] [==============62%           ] nsys_residual_long.nsys-rep[1/1] [===============66%          ] nsys_residual_long.nsys-rep[1/1] [===============67%          ] nsys_residual_long.nsys-rep[1/1] [========================100%] nsys_residual_long.nsys-rep[1/1] [========================100%] nsys_residual_long.nsys-rep
+profiled implementation=residual case=long_low_gva repetitions=10
+Generated:
+	/home/h3250106394/lab03/output/nsys_residual_long.nsys-rep
