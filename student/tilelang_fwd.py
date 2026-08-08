@@ -6,6 +6,7 @@ import tilelang
 import tilelang.language as T
 
 from student.tilelang_fwd_document import gdn_prefill_forward_document
+from student.tilelang_rs import tilelang_residual_first_full_chunks_rs
 
 
 CHUNK_SIZE = 64
@@ -16,6 +17,7 @@ LOG2E = 1.4426950408889634
 SCALE = HEAD_DIM_K**-0.5
 USE_DOCUMENT_FORM = os.environ.get("GDN_IMPL", "residual") == "document"
 DV_SPLIT_MODE = os.environ.get("GDN_DV_SPLIT", "auto")
+RS_MODE = os.environ.get("GDN_RS", "auto")
 PREFETCH_MODE = os.environ.get("GDN_PREFETCH", "auto")
 MEMORY_IO_MODE = os.environ.get("GDN_MEMORY_IO", "auto")
 DV_SPLIT_CONFIGS = {
@@ -581,7 +583,13 @@ def gdn_prefill_forward(
         prefetch_q, prefetch_k, prefetch_v, prefetch_a = (
             PREFETCH_INPUTS.get(prefetch_profile, PREFETCH_INPUTS["off"])
         )
-        recurrent = tilelang_residual_first_full_chunks(
+        use_rs = RS_MODE in ("auto", "on") and dv_tile >= 64
+        kernel_factory = (
+            tilelang_residual_first_full_chunks_rs
+            if use_rs
+            else tilelang_residual_first_full_chunks
+        )
+        recurrent = kernel_factory(
             num_heads_v,
             num_heads_qk,
             qk_dtype=q.dtype,
