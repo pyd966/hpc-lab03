@@ -292,7 +292,9 @@ def tilelang_residual_first_full_chunks(
     a_stage = 0 if prefetch_a else 1
     prefetch_inputs = prefetch_q or prefetch_k or prefetch_v or prefetch_a
     gate_stage = 0 if prefetch_inputs else 1
-    pipeline_order = [6, 0, 1, 2, 3, 4, 5] + list(range(7, 26))
+    # Issue the strided gate loads first so their latency overlaps the larger,
+    # contiguous Q/K/V/A copies before the common async-consumer wait.
+    pipeline_order = [6, 2, 3, 4, 5, 0, 1] + list(range(7, 30))
     pipeline_stage = [
         1,
         q_stage,
@@ -301,7 +303,7 @@ def tilelang_residual_first_full_chunks(
         a_stage,
         gate_stage,
         gate_stage,
-    ] + [1] * 19
+    ] + [1] * 23
     attention_name = "gva" if H != Hg else "mha"
     prefetch_tag = (
         ("q" if prefetch_q else "")
@@ -406,45 +408,79 @@ def tilelang_residual_first_full_chunks(
                 T.copy(a[bb, left:right, bh, 0:CHUNK_SIZE], a_shared)
                 T.copy(g[bb, left:right, bh], g_shared)
                 T.copy(beta[bb, left:right, bh], beta_shared)
+
+                # Keep independent WGMMA groups in flight and wait only at the
+                # first operation that consumes each accumulator fragment.
+                T.wgmma_gemm(k_shared, state_shared, z, clear_accum=True)
                 for token in T.Parallel(CHUNK_SIZE):
                     gamma_shared[token] = T.exp2(
                         g_shared[token] * LOG2E
                     )
                     inv_gamma_shared[token] = 1.0 / gamma_shared[token]
                 gamma_last[0] = gamma_shared[CHUNK_SIZE - 1]
-
-                T.gemm(k_shared, state_shared, z, clear_accum=True)
+                for dim_k, dim_v in T.Parallel(HEAD_DIM_K, dv_tile):
+                    state[dim_k, dim_v] *= gamma_last[0]
+                # G0 is the only outstanding group; z is first consumed here.
+                T.warpgroup_wait(0)
                 for token, dim in T.Parallel(CHUNK_SIZE, dv_tile):
                     z[token, dim] = beta_shared[token] * (
                         v_shared[token, dim]
                         - gamma_shared[token] * z[token, dim]
                     )
                 T.copy(z, z_shared)
-                T.gemm(a_shared, z_shared, z, clear_accum=True)
-                T.copy(z, z_shared)
-
-                T.gemm(q_shared, state_shared, out, clear_accum=True)
-                for token, dim in T.Parallel(CHUNK_SIZE, dv_tile):
-                    out[token, dim] *= SCALE * gamma_shared[token]
-
-                T.gemm(
+                T.wgmma_gemm(a_shared, z_shared, z, clear_accum=True)
+                T.wgmma_gemm(q_shared, state_shared, out, clear_accum=True)
+                T.wgmma_gemm(
                     q_shared,
                     k_shared,
                     score,
                     transpose_B=True,
                     clear_accum=True,
                 )
+
+                # Retire G1 (A @ residual), leaving G2/G3 in flight while
+                # zhat is formed. Neither out nor score is read yet.
+                T.warpgroup_wait(2)
+                for token, dim in T.Parallel(CHUNK_SIZE, dv_tile):
+                    z[token, dim] *= (
+                        gamma_last[0] * inv_gamma_shared[token]
+                    )
+                T.copy(z, z_shared)
+
+                # out and score are first consumed below, so G2/G3 must now
+                # both be complete.
+                T.warpgroup_wait(0)
+                for token, dim in T.Parallel(CHUNK_SIZE, dv_tile):
+                    out[token, dim] *= SCALE * gamma_shared[token]
                 for row, col in T.Parallel(CHUNK_SIZE, CHUNK_SIZE):
                     if row >= col:
                         score[row, col] *= (
                             SCALE
                             * gamma_shared[row]
-                            * inv_gamma_shared[col]
+                            * inv_gamma_shared[CHUNK_SIZE - 1]
                         )
                     else:
                         score[row, col] = 0
                 T.copy(score, score_shared)
-                T.gemm(score_shared, z_shared, out, clear_accum=False)
+
+                # Both updates consume zhat. The score's column decay was
+                # algebraically folded into its row scale above.
+                T.wgmma_gemm(
+                    score_shared,
+                    z_shared,
+                    out,
+                    clear_accum=False,
+                )
+                T.wgmma_gemm(
+                    k_shared,
+                    z_shared,
+                    state,
+                    transpose_A=True,
+                    clear_accum=False,
+                )
+                # Retire only G4 so the state update overlaps the output
+                # shared/global store while G5 remains in flight.
+                T.warpgroup_wait(1)
 
                 T.copy(out, z_shared)
                 T.copy(
@@ -456,21 +492,8 @@ def tilelang_residual_first_full_chunks(
                         dv_left : dv_left + dv_tile,
                     ],
                 )
-
-                for dim_k, dim_v in T.Parallel(HEAD_DIM_K, dv_tile):
-                    state[dim_k, dim_v] *= gamma_last[0]
-                for token, dim in T.Parallel(CHUNK_SIZE, dv_tile):
-                    z[token, dim] *= (
-                        gamma_last[0] * inv_gamma_shared[token]
-                    )
-                T.copy(z, z_shared)
-                T.gemm(
-                    k_shared,
-                    z_shared,
-                    state,
-                    transpose_A=True,
-                    clear_accum=False,
-                )
+                # The next chunk copies state to shared, so G5 retires here.
+                T.warpgroup_wait(0)
 
             T.copy(
                 state,
