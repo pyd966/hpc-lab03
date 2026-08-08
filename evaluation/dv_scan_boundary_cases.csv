@@ -1,0 +1,15 @@
+name,batch_size,seqlen,num_heads_qk,num_heads_v,use_initial_state,purpose,gate_mode
+o06_c032,6,2048,1,1,false,benchmark,random_decay
+o07_c032,7,2048,1,1,false,benchmark,random_decay
+o08_c032,8,2048,1,1,false,benchmark,random_decay
+o09_c032,9,2048,1,1,false,benchmark,random_decay
+o10_c032,10,2048,1,1,false,benchmark,random_decay
+o12_c032,12,2048,1,1,false,benchmark,random_decay
+o14_c032,14,2048,1,1,false,benchmark,random_decay
+o06_c128,6,8192,1,1,false,benchmark,random_decay
+o07_c128,7,8192,1,1,false,benchmark,random_decay
+o08_c128,8,8192,1,1,false,benchmark,random_decay
+o09_c128,9,8192,1,1,false,benchmark,random_decay
+o10_c128,10,8192,1,1,false,benchmark,random_decay
+o12_c128,12,8192,1,1,false,benchmark,random_decay
+o14_c128,14,8192,1,1,false,benchmark,random_decay

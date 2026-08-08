@@ -549,15 +549,17 @@ def gdn_prefill_forward(
     use_initial_state = initial_state is not None
     if initial_state is None:
         initial_state = torch.empty((1,), dtype=torch.float32, device=v.device)
+    full_chunks_only = num_tokens % CHUNK_SIZE == 0
     if DV_SPLIT_MODE == "auto":
         state_owners = batch_size * num_heads_v
+        # D=64 has one warp group per CTA. It wins when both value parts
+        # spread over a single 14-SM wave; 1..512 chunk sweeps show no
+        # additional chain-length crossover on the full-chunk RS path.
         split_profitable = (
-            chunks_per_batch >= 64
-            and state_owners < MIG_SM_COUNT
-            and state_owners * 4 <= 2 * MIG_SM_COUNT
+            full_chunks_only and state_owners * 2 <= MIG_SM_COUNT
         )
         dv_tile, dv_parts = (
-            DV_SPLIT_CONFIGS["32"]
+            DV_SPLIT_CONFIGS["64"]
             if split_profitable
             else DV_SPLIT_CONFIGS["off"]
         )
@@ -565,7 +567,6 @@ def gdn_prefill_forward(
         dv_tile, dv_parts = DV_SPLIT_CONFIGS.get(
             DV_SPLIT_MODE, DV_SPLIT_CONFIGS["off"]
         )
-    full_chunks_only = num_tokens % CHUNK_SIZE == 0
     if MEMORY_IO_MODE == "auto":
         use_memory_io = full_chunks_only
     else:

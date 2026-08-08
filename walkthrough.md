@@ -1,14 +1,13 @@
-# GDN prefill kernel walkthrough: RS WGMMA round
+# GDN prefill kernel walkthrough: RS WGMMA + measured dv dispatch
 
-本文件描述 commit 前工作树中的完整实现，即“优化 1：把 recurrent operand 从
-shared/shared WGMMA 改为 register/shared WGMMA”完成后的版本。内容以实际 TileLang
-lowering 和 H800 MIG profile 为准，不是伪代码设计稿。
+本文件描述当前 commit 前工作树中的完整实现：recurrent operand 使用 RS WGMMA，
+并按实测的 H800 MIG CTA wave 边界选择 D=64 或 D=128。内容以实际 TileLang
+lowering、生成 CUDA、公开及 synthetic sweep 和完整 NCU profile 为准。
 
 ## 1. 本轮结论
 
-原 D=128 路径把 FP32 recurrent state 和中间 Z 转成 BF16 后写到 shared memory，再由
-SS WGMMA 读回。新路径把 state 转置保存在 fragment 中，BF16 operand 也保存在 fragment
-中，用 Hopper RS WGMMA 直接读取寄存器端 A operand：
+RS 基础路径把 state 转置保存在 fragment 中，BF16 operand 也保存在 fragment 中，用
+Hopper RS WGMMA 直接读取寄存器端 A operand：
 
 ```text
 old: FP32 fragment -> BF16 shared -> SS WGMMA
@@ -21,7 +20,18 @@ D=128 的动态 shared 从 169.504 KiB 降到 137.504 KiB；代价是源码声�
 register/thread。占用率仍为 12.5%，所以加速来自更短的数据路径，而不是 occupancy
 上升。
 
-公开 8 case 全部 PASS，正式计时的简单平均预计分数从 94.76 提升到 **104.06**。
+本轮重新扫描 D=128、D=64、D=32 后，旧 auto 的 D=32 条件被替换为：
+
+```text
+owners = B * Hv
+full_chunks_only and 2 * owners <= 14 SM  -> D=64 RS, two value parts
+otherwise                                 -> D=128 RS, one value part
+```
+
+测试覆盖 1--512 chunks；对 full-chunk RS 路径，chain length 没有改变交叉点，真正
+的断点是 owners=7/8。D=32 在所有扫描点都没有胜过 D=64。公开 8 case 全部 PASS，
+`chain_equal` 从 0.617040 ms 降到 0.381504 ms；预计平均分从 104.06 提升到
+**105.67**。
 
 ## 2. Host dispatch 和 kernel launch
 
@@ -29,14 +39,16 @@ register/thread。占用率仍为 12.5%，所以加速来自更短的数据路�
 beta、A、initial state 和输出 tensor；这些 tensor 在 kernel launch 前已经位于 GPU
 HBM。CPU 到 HBM 的传输由 PyTorch tensor 创建/搬运阶段完成，不发生在本 kernel 内。
 
-dispatch 顺序如下：
+最终 dispatch 顺序如下：
 
-1. 若序列含不足 64 token 的 tail，tail 继续走原 SS 路径。
-2. full-chunk 路径根据 `GDN_DV_SPLIT` 选择 D=128、64 或 32。
-3. `GDN_RS=auto` 时，D>=64 选择
+1. 计算 `owners=B*Hv`、`chunks=ceil(T/64)` 和 `full_chunks_only=(T%64==0)`。
+2. `GDN_DV_SPLIT=auto` 且 `full_chunks_only && 2*owners<=14` 时选择 D=64；
+   其余选择 D=128。非 64 对齐输入不会拆分，因为它们不能走 full-chunk RS kernel。
+3. `GDN_DV_SPLIT=off/64/32` 可强制三档，用于 A/B；D=32 不进入 auto。
+4. `GDN_RS=auto` 时，D>=64 选择
    `tilelang_residual_first_full_chunks_rs`；D=32 因 Hopper WGMMA 的 M 维固定为
    64，继续使用验证过的 SS kernel。
-4. `GDN_RS=off` 可强制回到旧 SS 路径，用于 A/B。
+5. `GDN_RS=off` 可强制回到旧 SS 路径，用于 A/B。
 
 RS launch grid 为：
 
@@ -58,8 +70,82 @@ qk_head = value_head / (Hv / Hq)
 | SS D=32 | 32 | 4 | 256 | 2 | `4*B*Hv` |
 
 D=128 的两个 warp group 沿转置 state 的 value-row 方向分工，每组负责 64 个 value
-rows。每个 CTA 独占一个 `(batch,value_head,dv_part)` 的整条 chunk chain，state
-在 chunk 间一直驻留寄存器，因此不同 chunk 不能拆给不同 CTA。
+rows。D=64 的两个 CTA 各持有一个 64-column state slice，每个 CTA 只有一个 warp
+group。每个 CTA 独占 `(batch,value_head,dv_part)` 的整条 chunk chain，state 在
+chunk 间一直驻留寄存器，因此不同 chunk 不能拆给不同 CTA。
+
+### 2.1 当前允许的并行度
+
+实际设备查询见 `output/dv_hardware_props_60791.log`：
+
+| resource | H800 PCIe MIG 1g.10gb |
+| --- | ---: |
+| SM | 14 |
+| max resident warps/SM | 64 |
+| registers/SM | 65,536 x 32-bit |
+| max registers/thread | 255 |
+| shared memory/SM | 233,472 B |
+| opt-in shared/block | 232,448 B |
+| max threads/SM | 2,048 |
+
+架构上限与 [NVIDIA Hopper Tuning Guide](https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html)
+一致。实际 kernel 的资源限制比架构 warp 上限更早生效：
+
+| path | regs/thread | dynamic shared | resident CTA/SM | active warps/SM |
+| --- | ---: | ---: | ---: | ---: |
+| D=128 RS | 249 | 137.504 KiB | 1 | 8 |
+| D=64 RS | 255 | 113.504 KiB | 1 | 4 |
+| D=32 SS | 105 | 109.504 KiB | 2 | 16 |
+
+D=64 虽然 register 理论上允许两个 128-thread CTA，但每块还有约 1 KiB driver
+shared；两块总 shared 超过 228 KiB，因此 NCU 给出的 shared block limit 是 1。
+
+当 owners<=7 时，D=64 的 `2*owners` 个 CTA 能在 14 SM 上一次铺开；总 value
+warp-group 数与 D=128 相同，但使用两倍 SM。owners=8 时出现第 15、16 个 CTA，
+必须执行第二 wave，同时 Q/K/A/score 已被复制两次，所以性能发生阶跃式反转。
+
+### 2.2 三档扫描结果
+
+公开 case 强制三档，5 warmups、30 repetitions：
+
+| case | owners | chunks | D=128 RS ms | D=64 RS ms | D=32 SS ms | best |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| short_tail_state | 8 | tail | 0.142000 | 0.225408 | 0.231632 | D=128 |
+| chain_equal | 4 | 128 | 0.522624 | 0.376064 | 0.617520 | D=64 |
+| parallel_equal | 16 | 32 | 0.297888 | 0.323904 | 0.460800 | D=128 |
+| parallel_gva | 16 | 32 | 0.288368 | 0.313776 | 0.452608 | D=128 |
+| long_low_gva | 8 | 512 | 1.991760 | 2.974432 | 4.412448 | D=128 |
+| batch_split_gva | 32 | 128 | 1.502576 | 1.891648 | 3.016416 | D=128 |
+| wide_gva_state | 64 | 128 | 2.552000 | 4.218192 | 5.813280 | D=128 |
+| deep_gva_state | 32 | 256 | 3.058672 | 4.110816 | 5.976896 | D=128 |
+
+为了避免拟合公开 shape，另用固定 Hq=Hv=1、只改变 B 的 synthetic case 分离
+owners 和 chain。7/8 边界：
+
+| owners | D=128, 32 chunks | D=64, 32 chunks | D=128, 128 chunks | D=64, 128 chunks |
+| ---: | ---: | ---: | ---: | ---: |
+| 6 | 0.150160 | 0.110848 | 0.510576 | 0.361024 |
+| 7 | 0.151504 | 0.111440 | 0.510624 | 0.361648 |
+| 8 | 0.151408 | 0.195008 | 0.511632 | 0.697312 |
+| 9 | 0.151456 | 0.196288 | 0.512032 | 0.698832 |
+| 14 | 0.176352 | 0.199504 | 0.616160 | 0.711536 |
+
+chain-length scan（owners=1；owners=4/7 结论相同）：
+
+| chunks | D=128 ms | D=64 ms | D64 speedup |
+| ---: | ---: | ---: | ---: |
+| 1 | 0.033328 | 0.032896 | 1.013x |
+| 2 | 0.033504 | 0.032576 | 1.028x |
+| 4 | 0.042080 | 0.035792 | 1.176x |
+| 8 | 0.059072 | 0.046416 | 1.273x |
+| 16 | 0.092016 | 0.067328 | 1.367x |
+| 32 | 0.161568 | 0.111264 | 1.452x |
+| 128 | 0.559424 | 0.363072 | 1.541x |
+| 512 | 2.110688 | 1.376288 | 1.534x |
+
+因此 chain 越长收益越稳定，但不存在需要编码的最小 chunks 阈值。auto synthetic
+验证见 `output/dv_auto_synth_61023.log`：owners=1/2/4/7 与强制 D=64 一致，
+owners=14/28 与强制 D=128 一致，16 case 全部 PASS。
 
 ## 3. 数学方向为什么转置
 
@@ -135,6 +221,28 @@ NCU 实测为 249 registers/thread，零 local-memory spilling、零 shared-memo
 spilling。D=32 没有改变，仍为 48 KiB/block；此前 NCU 实测 105
 registers/thread。
 
+### 4.3 本轮 auto 活跃路径的前后变化
+
+本轮没有增加 fragment 声明，也没有改变任一 kernel 的静态资源；改变的是低 owner
+shape 实际 launch 哪个 kernel。`chain_equal` 是公开 case 中唯一发生切换的路径：
+
+| resource | 上一轮 auto: D=32 SS | 本轮 auto: D=64 RS |
+| --- | ---: | ---: |
+| logical fragment/block | 48 KiB | 104 KiB |
+| NCU registers/thread | 105 | 255 |
+| threads/block | 256 | 128 |
+| logical registers/block | 26,880 | 32,640 |
+| dynamic shared/block | 109.504 KiB | 113.504 KiB |
+| grid for owners=4 | 16 CTA | 8 CTA |
+| resident CTA/SM | 2 | 1 |
+| theoretical occupancy | 25% | 6.25% |
+
+D=64 生成 CUDA 每线程正好是 `state_t[64]`、`state_operand[64]`、`z_t[32]`、
+`out_t[32]`、`z_operand[32]` 和 `score[32]`。虽然局部 occupancy 更低，D=64
+只复制两次 QK/score 而不是 D=32 的四次，并且 8 个 CTA 一次铺到 8 个 SM；因此
+端到端更快。D=128 的 192 KiB logical fragment、249 registers/thread 和
+137.504 KiB shared 均未改变。
+
 ## 5. Shared memory 分配
 
 Q/K/V/A/g/beta 是 pipeline stage-0 producer，lowering 为它们生成 ping-pong 两份；
@@ -204,7 +312,12 @@ __syncthreads()
 | g + beta | 0.5 KiB |
 | **合计** | **56.5 KiB** |
 
-输出每 chunk 写 16 KiB。state 仅在 kernel 边界读/写各 64 KiB。cache miss 时请求从
+D=64 每个 CTA 只读 8 KiB V slice、写 8 KiB output，单 CTA 输入为 48.5 KiB；
+但一个 logical owner 有两个 CTA，所以聚合输入是 97 KiB/chunk。相对 D=128 多出的
+40.5 KiB 是第二份 Q/K/A/g/beta，这就是拆分的复制成本。两个 part 的 state 边界
+流量各 32 KiB，聚合后仍与 D=128 相同。
+
+D=128 输出每 chunk 写 16 KiB。state 仅在 kernel 边界读/写各 64 KiB。cache miss 时请求从
 HBM 经 L2/L1 到 shared/register；cache hit 时可由 L2 服务。代码本身不会逐 chunk
 执行“HBM 搬到 L2”的显式指令，`cp.async` 发的是 global-memory request，缓存层级由
 硬件决定。
@@ -279,98 +392,119 @@ long-scoreboard 的下降远大于这个代价。
 
 ## 8. 正确性和正式 8 case
 
-正式任务：`output/rs_final_8case_60486.log`，10 warmups、100 repetitions，8 个
-case 均为 PASS。
+正式任务：`output/dv_auto_final_8case_60996.log`，10 warmups、100 repetitions，
+8 case 均为 PASS。
 
-| case | 上一版 ms | 本轮 ms | speedup | `p=t100/t` | 预计分数 |
+| case | 上一轮 ms | 本轮 ms | speedup | `p=t100/t` | 预计分数 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `short_tail_state` | 0.144704 | 0.146080 | 0.9906x | 2.3689 | 120.00 |
-| `chain_equal` | 0.614640 | 0.617040 | 0.9961x | 0.8067 | 91.17 |
-| `parallel_equal` | 0.408720 | 0.297456 | 1.3741x | 1.7188 | 114.38 |
-| `parallel_gva` | 0.387504 | 0.289280 | 1.3395x | 1.6992 | 113.98 |
-| `long_low_gva` | 2.958256 | 1.978032 | 1.4956x | 0.9397 | 97.27 |
-| `batch_split_gva` | 2.214960 | 1.494240 | 1.4823x | 1.0254 | 100.51 |
-| `wide_gva_state` | 3.707360 | 2.535616 | 1.4621x | 0.9570 | 98.05 |
-| `deep_gva_state` | 4.491200 | 3.021616 | 1.4864x | 0.9370 | 97.12 |
+| `short_tail_state` | 0.146080 | 0.143008 | 1.0215x | 2.4198 | 120.00 |
+| `chain_equal` | 0.617040 | 0.381504 | 1.6174x | 1.3048 | 106.10 |
+| `parallel_equal` | 0.297456 | 0.296416 | 1.0035x | 1.7248 | 114.50 |
+| `parallel_gva` | 0.289280 | 0.293072 | 0.9871x | 1.6772 | 113.54 |
+| `long_low_gva` | 1.978032 | 1.974816 | 1.0016x | 0.9413 | 97.34 |
+| `batch_split_gva` | 1.494240 | 1.496288 | 0.9986x | 1.0240 | 100.48 |
+| `wide_gva_state` | 2.535616 | 2.618208 | 0.9685x | 0.9268 | 96.68 |
+| `deep_gva_state` | 3.021616 | 3.052224 | 0.9900x | 0.9276 | 96.69 |
 
 预计分数使用课程文档公开的 60/100 turning points 分段线性计算，100 分以上按
-`min(120,100+20*(p-1))`。公开 8 case 简单平均为 **104.06**。
+`min(120,100+20*(p-1))`。公开 8 case 简单平均为 **105.67**，比上一轮
+104.06 增加 1.61 分。
 
-short 和 chain 仍走未修改的 tail/D32 SS path，其 1% 内波动属于测量噪声；其余
-D=128 case 得到 1.34x--1.50x 加速。
+只有 `chain_equal` 按规则从 D=32 切到 D=64；其余 case 的 dispatch 与上一轮完全
+相同，因此其小幅正负变化是跨任务时钟/测量波动，不应被解释为规则导致的回退。
 
 ## 9. 完整 NCU profile
 
-可直接在 Nsight Compute GUI 打开的报告：
+本轮新生成、可直接由 Nsight Compute GUI 打开的报告：
 
-- `output/ncu_rs_long_full.ncu-rep`
-- `output/ncu_rs_wide_full.ncu-rep`
+- `output/ncu_dv_auto_chain_full.ncu-rep`
+- `output/ncu_dv_auto_wide_full.ncu-rep`
 
-可读导出：
+完整可读导出：
 
-- `output/ncu_rs_long_full_details.txt`
-- `output/ncu_rs_long_full_source.csv`
-- `output/ncu_rs_wide_full_details.txt`
-- `output/ncu_rs_wide_full_source.csv`
+- `output/ncu_dv_auto_chain_full_details.txt`
+- `output/ncu_dv_auto_chain_full_source.csv`
+- `output/ncu_dv_auto_wide_full_details.txt`
+- `output/ncu_dv_auto_wide_full_source.csv`
 
 两份报告均由 `--set full --section PmSampling_WarpStates` 生成，共 47 passes；
 `details.txt` 使用 `--print-details all`，包含完整 Warp State Statistics，
-`source.csv` 包含 SASS/source 关联的每类 stall sample。
+`source.csv` 包含 SASS/source 关联的全部 stall sample。
 
-### 9.1 wide 前后对比
+### 9.1 chain：上一轮 D=32 对本轮 D=64
 
-| metric | 修改前 SS | 修改后 RS | 变化 |
+| metric | D=32 SS | D=64 RS | 变化 |
 | --- | ---: | ---: | ---: |
-| NCU duration | 3.78 ms | 2.54 ms | 1.488x |
-| registers/thread | 206 | 249 | +43 |
-| dynamic shared/block | 173.58 kB | 140.82 kB | -32 KiB |
-| theoretical/achieved occupancy | 12.5% / 12.5% | 12.5% / 12.5% | 不变 |
-| DRAM throughput | 44.27% | 65.68% | +21.41 pp |
-| compute throughput | 22.53% | 33.05% | +10.52 pp |
-| stall barrier | 3.05 CPI | 1.02 CPI | -66.6% |
-| stall long scoreboard | 1.62 CPI | 0.55 CPI | -66.0% |
-| stall short scoreboard | 0.94 CPI | 0.50 CPI | -46.8% |
-| stall MIO throttle | 0.23 CPI | 1.16 CPI | +0.93 CPI |
+| NCU duration | 579.87 us | 346.98 us | 1.671x |
+| grid / waves per SM | 16 / 0.57 | 8 / 0.57 | CTA 数减半 |
+| registers/thread | 105 | 255 | +150 |
+| dynamic shared/block | 112.14 kB | 116.24 kB | +4 KiB |
+| theoretical occupancy | 25.0% | 6.25% | -18.75 pp |
+| achieved occupancy | 14.33% | 6.25% | -8.08 pp |
+| DRAM throughput | 25.17% | 42.02% | +16.85 pp |
+| compute throughput | 26.00% | 16.43% | -9.57 pp |
+| stall barrier | 3.13 CPI | 0.56 CPI | -82.1% |
+| stall long scoreboard | 1.90 CPI | 0.19 CPI | -90.0% |
+| stall short scoreboard | 0.48 CPI | 0.52 CPI | +0.04 CPI |
+| stall wait | 0.77 CPI | 0.99 CPI | +0.22 CPI |
+| stall MIO throttle | 0.02 CPI | 0.05 CPI | +0.03 CPI |
 
-RS 版本的 not-issued samples 包括
-`mio_throttle=9213, barrier=7798, wait=4453, long_scoreboard=3956,
-short_scoreboard=3149, warpgroup_arrive=1306`。当前最大的新瓶颈是 fragment
-layout/convert 带来的 MIO pressure，而不是此前 dominant 的 barrier/long scoreboard。
+D=64 的 occupancy 数字更低并不矛盾：occupancy 是“每个已激活 SM 内的 active
+warps”，不表示 grid 使用了多少个 SM。D=64 使用 8 SM 而 D=128 只会使用 4 SM；
+相比旧 D=32，它又把重复的 QK/score 从四份减到两份。因此执行的 tensor work 更少，
+compute-throughput 百分比下降但 wall time 缩短。
 
-### 9.2 long 低并行 case
+D=64 not-issued samples 为
+`wait=1178, barrier=705, short_scoreboard=673, long_scoreboard=246,
+mio_throttle=63, warpgroup_arrive=61`。long-scoreboard 已不是主要瓶颈，当前主要
+空泡来自显式 WGMMA wait、barrier 和仅一个 warp group/SM 带来的低 eligible warps。
 
-| metric | RS profile |
+### 9.2 wide：高 owner D=128 分支
+
+| metric | current D=128 |
 | --- | ---: |
-| NCU duration | 1.98 ms |
-| grid / waves per SM | 8 CTAs / 0.57 |
+| NCU duration | 2.58 ms |
+| grid / waves per SM | 64 / 4.57 |
 | registers/thread | 249 |
 | dynamic shared/block | 140.82 kB |
 | theoretical/achieved occupancy | 12.5% / 12.5% |
-| DRAM / compute throughput | 40.08% / 21.46% |
-| barrier / long scoreboard | 0.98 / 0.52 CPI |
+| DRAM / compute throughput | 64.68% / 33.04% |
+| MIO / barrier / wait | 1.16 / 1.02 / 0.74 CPI |
+| long / short scoreboard | 0.54 / 0.50 CPI |
 
-NCU 明确指出 grid 只有 8 blocks，小于 14 SM；这也是下一轮重新评估 dv 拆分的直接
-依据。RS 已缩短单 CTA 的关键路径，所以旧版基于 SS kernel 测出的拆分阈值不能直接
-沿用。
+该结果与上一轮 D=128 profile 的 2.54 ms、0.55 long-scoreboard CPI 一致，确认新
+dispatch 没有改变高 owner kernel。
 
-## 10. 生成代码与剩余限制
+## 10. 生成代码、扫描文件和限制
 
-最终 D=128 CUDA：
+最终生成 CUDA：
 
-- `output/rs_generated_dv128_60595.log`
+- D=64：`output/dv_auto_generated_dv64_61045.log`
+- D=128：`output/rs_generated_dv128_60595.log`
 
-它包含 kernel launch bounds、每线程数组、`cp_async` 双缓冲、RS/SS WGMMA、
-五个 wait 和 TMA output store，可用于逐条核对上述流程。
+两者都包含 launch bounds、每线程 fragment 数组、`cp_async` 双缓冲、RS/SS
+WGMMA、五个精确 wait 和 TMA output store。D=64 为
+`__launch_bounds__(128,1)`，D=128 为 `__launch_bounds__(256,1)`。
 
-当前限制：
+原始 sweep：
 
-1. D=32 不能直接使用 M=32 RS WGMMA，仍保留 SS path。
-2. D=64 虽能使用一个 warp group 的 RS kernel，但是否值得把 D=128 拆成两个 CTA
-   取决于 14-SM MIG 上的可驻留 blocks、owner 数和 chain 长度，不能只按公开 case
-   名称 dispatch。
-3. 249 registers/thread 已接近 255 上限；继续增加 fragment 很可能 spill。
-4. shared 降低没有提升 D=128 occupancy，因为 register 和 shared 均把每 SM 限制为
-   一个 CTA。
+- public 三档：`output/dv_rs_public_off_60808.log`、
+  `output/dv_rs_public_64_60838.log`、`output/dv_rs_public_32_60861.log`
+- owners x long chain：`output/dv_rs_synth_off_60890.log`、
+  `output/dv_rs_synth_64_60905.log`、`output/dv_rs_synth_32_60918.log`
+- 1--16 chunks：`output/dv_rs_short_off_60941.log`、
+  `output/dv_rs_short_64_60948.log`
+- 7/8 boundary：`output/dv_rs_boundary_off_60969.log`、
+  `output/dv_rs_boundary_64_60982.log`
 
-下一轮将独立扫描 D=128 RS、D=64 RS、D=32 SS，在额外 synthetic
-`B*Hv x chain_length` 网格上总结规则，再提交另一 commit。
+当前限制和下一步：
+
+1. D=64 shared 加 1 KiB driver allocation 后只比“两 CTA/SM”上限多约 516 B
+   dynamic shared。若复用 gamma/inverse/gate buffer 省下至少 516 B，就可能让
+   D=64 达到两个 CTA/SM；届时必须重新扫描规则，owners=8 以上可能受益。
+2. D=64 已用满 255 registers/thread，继续增加 fragment 会 spill。
+3. D=32 因缺少自然的 M=32 RS WGMMA，在当前实现中始终输给 D=64；保留它仅用于
+   强制实验，不进入 auto。
+4. 当前公开 long/wide/deep 仍约 96.7--97.3 分。要达到每 case 100+，下一步比继续
+   调 dv 更有前景的是压缩 D=64 shared 以改变 residency，以及降低 D=128 的
+   fragment conversion/MIO pressure。
