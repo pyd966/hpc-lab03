@@ -303,7 +303,7 @@ chunk 串行走到最后一个 chunk。不同 part 写入互不重叠的
 | buffer | shape/dtype | 逻辑大小 | 是否随 D 变化 | 用途 |
 | --- | --- | ---: | --- | --- |
 | `q_shared` | `[64,128]` BF16 | 16 KiB | 否 | Q Tensor Core operand |
-| `k_shared` | `[64,128]` BF16 | 16 KiB | 否 | K Tensor Core operand |
+| `k_shared` | `[64,128]` BF16 | 16 KiB/stage | 否 | K Tensor Core operand；prefetch 路径由编译器分配 2 stages |
 | `v_shared` | `[64,D]` BF16 | `128D` B | 是 | 当前 value-column slice |
 | `a_shared` | `[64,64]` BF16 | 8 KiB | 否 | triangular inverse A |
 | `z_shared` | `[64,D]` BF16 | `128D` B | 是 | R/Z/decayed-Z operand |
@@ -322,6 +322,9 @@ chunk 串行走到最后一个 chunk。不同 part 写入互不重叠的
 | `D=64, P=2` | 82,692 B = 80.754 KiB |
 | `D=32, P=4` | 66,308 B = 64.754 KiB |
 
+上表是单 stage 的显式 source buffer。K-only ping-pong 在 `D=32,P=4` 上再增加一个 16 KiB
+`k_shared` stage，pipeline lowering 后的逻辑 shared 总量为 80.754 KiB。
+
 fragment 是分布式 register tile：
 
 ```text
@@ -338,7 +341,8 @@ source-level fragment 数据总量为 `16 KiB + D KiB`。它们分布在 256 个
 | --- | ---: | ---: | ---: | ---: | ---: |
 | 修改前 `D=128,P=1` | 144 KiB | 202 | 112.754 KiB | 115.47 KiB | 1 |
 | 消融 `D=64,P=2` | 80 KiB | 未 profile | 80.754 KiB | 未 profile | 未 profile |
-| 当前 split `D=32,P=4` | 48 KiB | 104 | 64.754 KiB | 66.32 KiB | 2 |
+| prefetch 前 split `D=32,P=4` | 48 KiB | 104 | 64.754 KiB | 66.32 KiB | 2 |
+| K ping-pong `D=32,P=4` | 48 KiB | 114 | 80.754 KiB | 82.70 KiB | 2 |
 
 source 数字只统计显式 buffer；NCU 数字包含 backend layout/alignment，并反映编译后的寄存器
 liveness，因此两列不应直接换算。以后每版同时报告这两种口径。
@@ -370,10 +374,11 @@ inv_gamma_shared[i]  = 1 / gamma_shared[i]
 gamma_last           = gamma_shared[63] or exp2(global tail g * LOG2E)
 ```
 
-`state` 使用 `T.copy`，Q/K/V/A/g/beta 使用 `T.Parallel`。这里没有 `T.async_copy`、TMA、
-`T.Pipelined`、double buffer 或跨 chunk prefetch；所有当前 chunk 的装载和 gate 预计算结束后才开始
-GEMM 1。这里仍然没有跨 chunk prefetch。拆分后 Q/K/A/g/beta 和 gate 预计算会被每个 part 重复，
-V/state/output/final_state 则按 value 列分片。尾块将无效 Q/K/V/A row 填零，将无效
+`state` 和 K 使用 `T.copy`，Q/V/A/g/beta 使用 `T.Parallel`。默认 `_pfk` 路径把 K copy 标成
+pipeline stage 0，其余 21 个 statement 保持 stage 1；TileLang lowering 会把下一 chunk 的 K 变成
+`cp.async`，写入另一个 `k_shared` stage。`_base` 路径仍是单 K buffer，没有跨 chunk prefetch。
+Q/A/g/beta 会被每个 part 重复，V/state/output/final_state 则按 value 列分片。尾块的 K
+`cp.async` 带 predicate 并对无效 row 零填充；手工路径将无效 Q/V/A row 填零，将无效
 `gamma/inv_gamma` 设为 1、`beta` 设为 0；`gamma_last` 始终对应最后一个有效 token。
 
 ### 10.2 GEMM 1：用 K 从旧 state 读取预测
@@ -472,7 +477,7 @@ state += K^T @ z
 ```
 
 这里同样使用 `clear_accum=False`，把 rank-64 chunk update 累加到已经衰减的 FP32 state fragment。
-随后进入下一个 `T.serial` chunk。所有 chunk 完成后，CTA 才把自己的 `[128,D]` state slice
+随后进入下一个逻辑串行 chunk。所有 chunk 完成后，CTA 才把自己的 `[128,D]` state slice
 写到 global FP32 `final_state[...,dv_left:dv_left+D]`。
 
 ## 11. 为什么 chunks 串行、chunk 内并行
@@ -483,18 +488,21 @@ state += K^T @ z
 S_(c+1) depends on S_c
 ```
 
-因此每个 `(batch, head, dv_part)` block 内的 chunk loop 不能简单换成 `T.Parallel` 或
-`T.Pipelined` 后同时计算多个完整 chunk。dv 分片只并行独立的 value 列；GEMM 1 (`K@S`) 和
-GEMM 3 (`Q@S`) 仍必须等待本 part 的当前 `S`。
+因此每个 `(batch, head, dv_part)` block 内不能同时计算多个完整 chunk。当前代码虽然使用
+`T.Pipelined` 作为调度器，但只有不依赖 state 的 K copy 放在 stage 0；state copy、gate 计算和六次
+GEMM 都在 stage 1，仍按 recurrent dependency 串行。dv 分片只并行独立的 value 列；GEMM 1
+(`K@S`) 和 GEMM 3 (`Q@S`) 仍必须等待本 part 的当前 `S`。
 
 可以提前并行/流水的是：
 
 ```text
-load Q_(c+1), K_(c+1), V_(c+1), A_(c+1), g_(c+1), beta_(c+1)
+load K_(c+1)                  # 当前已实现
+load Q/V/A/g/beta_(c+1)      # 仍待验证
 ```
 
 这些输入不依赖 `S_c`。所以合理的 pipeline 是“当前 chunk 计算 + 下一 chunk 数据搬运”，而不是让
-多个 chunk 同时更新同一个 state。
+多个 chunk 同时更新同一个 state。本版先只流水 K，因为它是三次 GEMM 的操作数，且单独双缓冲后
+仍能在目标 `D=32` 路径保持 2 blocks/SM；Q/V/A 全量双缓冲的消融反而增加资源压力并变慢。
 
 ## 12. 精确的计算量
 
@@ -703,10 +711,140 @@ repetitions，所有 output/final-state 正确性检查均通过：
 **88.47 分**；未选择 split 的 case 变化在约 -1.1% 到 +0.1%，属于跨任务时钟/测量波动范围。
 最终完整日志为 `output/dv_split_auto_final_56860.log`。
 
-## 16. 从当前代码出发的优化检查表
+## 17. 优化 3：K-only ping-pong prefetch
 
-1. 下一 chunk 的 global-to-shared load 能否用 `T.Pipelined`/async copy/TMA 与当前 GEMM 重叠？
-2. ping-pong buffer 增加的 shared memory 是否仍允许目标 occupancy？
+### 17.1 分派与 pipeline 标注
+
+wrapper 新增 `GDN_PREFETCH=auto|on|off`。默认自动策略为：
+
+```python
+prefetch_k = dv_parts > 1 and chunks_per_batch >= 64
+```
+
+因此公开 case 中只有采用 `D=32,P=4` 且有 128 chunks 的 `chain_equal` 启用
+`residual_mha_dv32x4_pfk`；其余 case 走 `_base`。强制 `on/off` 只用于消融。
+chunk loop 改为 `T.Pipelined`，22 个顶层 statement 的调度为：
+
+```text
+order = [1, 0, 2, ..., 21]  # 先看 K copy，再看 state copy 和其余计算
+stage = [1, 0, 1, ..., 1]   # 只有 K copy 属于跨迭代 stage 0
+```
+
+关闭 prefetch 时 K 的 stage 也设为 1，因而只生成单 buffer 的普通当前 chunk copy。K 从原来的
+Q/K/V 手工标量循环中拆成独立 `T.copy`；这让 backend 能生成 16-byte vectorized copy，并让
+pipeline pass 单独识别 K，而不改变数值公式。
+
+### 17.2 从 launch 到结束的完整时序
+
+1. Python wrapper 根据 `B,T,Hq,Hv` 算出 `chunks_per_batch=ceil(T/64)`、`D/P` 和
+   `prefetch_k`，分配 global BF16 `output[B,T,Hv,128]` 与 FP32
+   `final_state[B,Hv,128,128]`，取得对应 specialization 的已缓存 JIT kernel。
+2. launch grid 为 `B*Hv*P` 个 CTA，每 CTA 256 threads。block id 解码成
+   `(batch,value_head,dv_part)`，并得到共享的 Q/K head 与本 CTA 的
+   `dv_left:dv_left+D`。不同 CTA 只写互不重叠的 output/state value columns。
+3. 每 CTA 分配 FP32 fragment：`state[128,D]`、`z[64,D]`、`out[64,D]`、
+   `score[64,64]`。目标 `D=32` 路径的源码 fragment 总量是 48 KiB/block。shared 中分配
+   Q、V、A、Z、state、score、gate buffers；K 在 `_pfk` 中由 lowering 扩成两个
+   `[64,128]` BF16 stages。
+4. CTA 从 global FP32 `initial_state` 读入自己的 `[128,D]` slice；无 initial state 时清零
+   state fragment。该 fragment 在所有 chunks 之间驻留，不会预取下一 state，因为
+   `S_(c+1)` 必须等待 `S_c` 更新完成。
+5. pipeline prologue 把 `K_0` 从 global memory 以 predicated 16-byte `cp.async` 发到
+   `k_shared[0]`，随后 `cp_async_commit`。尾块超出 `num_tokens` 的 row 由 conditional
+   async copy 零填充。
+6. steady-state 迭代 c 开头先把 `K_(c+1)` 发往
+   `k_shared[(c+1)&1]` 并 commit；与此同时当前迭代继续执行 state
+   fragment-to-shared 转换，以及 Q/V/A/g/beta 的当前 chunk global-to-shared load 和 gamma
+   预计算。随后 `cp_async_wait<1>` 保证 `K_c` 已就绪，而下一组 K copy 可继续在途。
+7. 当前 `k_shared[c&1]` 依次参与 GEMM 1 `K@S`、GEMM 4 `Q@K^T` 和 GEMM 6
+   `K^T@Z`。中间完整执行 residual、`A@R`、`Q@S`、causal/gate score、
+   `score@Z`、global output 写回、state/gamma 衰减和 state update。两个 K stage 防止下一
+   chunk 的 async copy 覆盖仍被当前三次 GEMM 使用的 tile。
+8. main loop 完成后，epilogue 用 `cp_async_wait<0>` 排空最后一组 copy，消费最后一个 K stage，
+   写最后一个 chunk 的有效 output row。最后把常驻 FP32 state fragment 写回 global
+   `final_state[...,dv_left:dv_left+D]`，CTA 和 kernel 结束，wrapper 返回两个张量。
+
+生成 CUDA 的直接证据保存在 `output/pingpong_generated_cuda_57195.log`：prologue 在第 37--39
+行生成 `cp_async_gs_conditional<16>` 与 commit；steady state 在第 44 行用
+`((chunk+1)&1)*8192` 个 BF16 element 的 stage offset 发下一块，第 95 行
+`cp_async_wait<1>` 后用 `(chunk&1)*8192` 消费当前块；第 345 行用
+`cp_async_wait<0>` 排空 epilogue。这里是实际的 global-to-shared prefetch，不只是多分配一份
+shared memory。Q/V/A/g/beta 仍是当前 chunk 的同步装载，没有 double buffer 或 TMA。
+
+### 17.3 Fragment、shared memory 与 NCU
+
+目标 `D=32,P=4` 路径修改前后为：
+
+| 资源 | dv-split 版本 | K ping-pong 版本 | 变化 |
+| --- | ---: | ---: | ---: |
+| source FP32 fragment/block | 48 KiB | 48 KiB | 0 |
+| NCU registers/thread | 104 | 114 | +10 |
+| source 单-stage shared/block | 64.754 KiB | 64.754 KiB | 0 |
+| pipeline lowering 后逻辑 shared/block | 64.754 KiB | 80.754 KiB | +16 KiB |
+| NCU dynamic shared/block | 66.32 KiB | 82.70 KiB | +16.38 KiB |
+| theoretical blocks/SM | 2 | 2 | 0 |
+
+fragment shape 没有变化；寄存器增加来自 pipeline 跨迭代 liveness。自动策略未启用 prefetch 的
+`D=128,P=1` 路径仍为 144 KiB source fragment、112.754 KiB source shared、约
+115.47 KiB NCU dynamic shared 和 202 registers/thread。
+
+对 `chain_equal` 的 NCU basic 对照：
+
+| 指标 | prefetch 前 | K ping-pong |
+| --- | ---: | ---: |
+| grid blocks / threads | 16 / 256 | 16 / 256 |
+| registers/thread | 104 | 114 |
+| dynamic shared/block | 66.32 KiB | 82.70 KiB |
+| theoretical blocks/SM / occupancy | 2 / 25.00% | 2 / 25.00% |
+| achieved occupancy | 14.34% | 14.31% |
+| active warps/SM | 9.18 | 9.16 |
+| profiled duration | 0.770 ms | 0.759 ms |
+| compute / memory throughput | 20.25% / 42.48% | 20.43% / 42.74% |
+
+虽然 shared 和 registers 增加，H800 MIG 的 167.94 KiB shared 配置仍允许两个该 CTA 驻留，
+理论 occupancy 未下降。报告为 `output/ncu_pingpong_chain.ncu-rep`。
+
+### 17.4 消融与自动选择
+
+先用 5 warmups/20 repetitions 强制比较 K pipeline：
+
+| case | prefetch off ms | prefetch on ms | on/off speedup | 结论 |
+| --- | ---: | ---: | ---: | --- |
+| `short_tail_state` | 0.144 | 0.152 | 0.9474x | 短序列无法摊薄 prologue/epilogue |
+| `chain_equal` | 0.813 | 0.781 | **1.0410x** | 保留 |
+| `long_low_gva` | 3.683 | 3.849 | 0.9569x | `D=128` 资源压力更差 |
+
+全量 Q/K/V/A/g/beta pipeline 在 gate shared 路径遇到 lowering/同步问题；只对 Q/K/V/A
+做 pipeline 虽正确，但 `chain_equal` 为约 0.983 ms，明显回退。手工 3D K 双缓冲会破坏 K
+原本适合 WGMMA 的二维 operand lowering，`chain_equal` 约 0.835 ms，也不如 compiler-managed
+K-only 的 0.781 ms。因此最终只保留二维 K tile 的 compiler-managed 两级 pipeline，并限制到
+长链、已沿 dv 拆分的路径。
+
+### 17.5 完整 8-case 结果
+
+正式结果使用默认 10 warmups、100 repetitions、CUDA event 中位数；8 个 output/final-state
+正确性检查全部 PASS。baseline 是上一提交的 dv-split auto：
+
+| case | dv baseline ms | ping-pong auto ms | speedup | `p=t100/t` | 预计分数 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `short_tail_state` | 0.144560 | 0.141712 | 1.0201x | 2.4419 | 120.00 |
+| `chain_equal` | 0.792768 | 0.783312 | **1.0121x** | 0.6355 | 83.35 |
+| `parallel_equal` | 0.550848 | 0.546928 | 1.0072x | 0.9348 | 96.51 |
+| `parallel_gva` | 0.497872 | 0.495152 | 1.0055x | 0.9927 | 99.61 |
+| `long_low_gva` | 3.672976 | 3.547856 | 1.0353x | 0.5239 | 78.42 |
+| `batch_split_gva` | 2.834256 | 2.770096 | 1.0232x | 0.5531 | 79.33 |
+| `wide_gva_state` | 5.091840 | 5.059728 | 1.0063x | 0.4796 | 76.40 |
+| `deep_gva_state` | 5.791568 | 5.721424 | 1.0123x | 0.4948 | 76.92 |
+
+预计分数沿用第 14 节的分段线性公式，公开 8 case 简单平均为 **88.82 分**，高于上一版
+88.47。只有 `chain_equal` 实际启用双缓冲；其余 case 的小幅变化来自把 K 单独改为
+vectorized `T.copy` 以及测量波动，不能归因于跨 chunk prefetch。完整日志为
+`output/pingpong_auto_final_57155.log`。
+
+## 18. 从当前代码出发的优化检查表
+
+1. Q/V/A 中是否还有单个 buffer 值得在不降低 occupancy 的前提下独立做 pipeline？
+2. K ping-pong 能否在其他优化降低 registers/shared 后扩大到更多 case？
 3. `q/k/v/a/z/score/state` 的 shared layout 是否存在 bank conflict 或 Tensor Core operand replay？
 4. TileLang 对六次 `T.gemm` 各自生成了 `mma` 还是 `wgmma`，shape 是否充分利用 N>=32 的 Hopper
    Tensor Core throughput？

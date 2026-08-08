@@ -32,8 +32,16 @@
 
 再看 profile 结果。
 
-现在 shared memory 173.58KB/block，256 threads/block，50432 regs/block，这说明我们没办法在一个 SM 上塞两个 block。这很大程度上影响了我们的并行度。
+现在 shared memory 115KB/block，202 threads/block，51712 regs/block，这说明我们没办法在一个 SM 上塞两个 block。这很大程度上影响了我们的并行度。
+
+此外，很多 case 自己的并行度（`B*Hv`）就不高。
 
 对 long_low_gva 进行 profile，发现 mem 和 compute 的利用率都很低。这证实了我们的猜想，当前的问题是 latency bound，主要思路是用更高的并行度掩盖掉 latency。
 
-这时我们发现一个非常重要的
+这时我们发现一个非常重要的特性：state 与 out 的更新在 $dv$ 维度是彼此独立的。也就是说我们可以从 $dv$ 维度凭空切分出更高的并行度出来。
+
+尝试之后，发现在当前版本下，只有 `chain_equal` case 取得了 1.16x 的收益，别的 case 反而略有下降。因为切分之后会有重复的 `Q @ K^T` 计算，所以当前收益不大是正常的。也许随着我们的进一步优化，切分 dv 会更有前景（毕竟现在理论并行度上限也不高，我们想进一步做切分 dv 还得优化 fragment 和 shared mem 占用）
+
+## step4
+
+我们发现 shared mem 占用并不算高，所以考虑使用 pingpong buffer 做 prefetch。

@@ -16,6 +16,7 @@ LOG2E = 1.4426950408889634
 SCALE = HEAD_DIM_K**-0.5
 USE_DOCUMENT_FORM = os.environ.get("GDN_IMPL", "residual") == "document"
 DV_SPLIT_MODE = os.environ.get("GDN_DV_SPLIT", "auto")
+PREFETCH_MODE = os.environ.get("GDN_PREFETCH", "auto")
 DV_SPLIT_CONFIGS = {
     "off": (HEAD_DIM_V, 1),
     "64": (64, 2),
@@ -38,6 +39,7 @@ def tilelang_residual_first(
     use_initial_state,
     dv_tile,
     dv_parts,
+    prefetch_k,
 ):
     batch_size = T.dynamic("batch_size")
     num_tokens = T.dynamic("num_tokens")
@@ -47,6 +49,7 @@ def tilelang_residual_first(
     a_shape = (batch_size, num_tokens, H, CHUNK_SIZE)
     state_shape = (batch_size, H, HEAD_DIM_K, HEAD_DIM_V)
     initial_shape = state_shape if use_initial_state else (1,)
+    k_pipeline_stage = 0 if prefetch_k else 1
     attention_name = "gva" if H != Hg else "mha"
     kernel_name = (
         "residual_"
@@ -55,6 +58,7 @@ def tilelang_residual_first(
         + str(dv_tile)
         + "x"
         + str(dv_parts)
+        + ("_pfk" if prefetch_k else "_base")
     )
 
     @T.prim_func
@@ -118,22 +122,35 @@ def tilelang_residual_first(
             else:
                 T.clear(state)
 
-            for chunk in T.serial(chunks_per_batch):
+            # Statement 1 is the K copy: only it crosses iterations. The
+            # recurrent state work remains in stage 1.
+            for chunk in T.Pipelined(
+                chunks_per_batch,
+                order=[
+                    1, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                    11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+                ],
+                stage=[
+                    1, k_pipeline_stage, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                ],
+            ):
                 left = chunk * CHUNK_SIZE
                 right = left + CHUNK_SIZE
 
                 T.copy(state, state_shared)
+                T.copy(
+                    k[bb, left:right, bhg, 0:HEAD_DIM_K], k_shared
+                )
                 for token, dim in T.Parallel(CHUNK_SIZE, HEAD_DIM_K):
                     if left + token < num_tokens:
                         q_shared[token, dim] = q[bb, left + token, bhg, dim]
-                        k_shared[token, dim] = k[bb, left + token, bhg, dim]
                         if dim < dv_tile:
                             v_shared[token, dim] = v[
                                 bb, left + token, bh, dv_left + dim
                             ]
                     else:
                         q_shared[token, dim] = 0
-                        k_shared[token, dim] = 0
                         if dim < dv_tile:
                             v_shared[token, dim] = 0
                 for row, col in T.Parallel(CHUNK_SIZE, CHUNK_SIZE):
@@ -290,6 +307,11 @@ def gdn_prefill_forward(
         dv_tile, dv_parts = DV_SPLIT_CONFIGS.get(
             DV_SPLIT_MODE, DV_SPLIT_CONFIGS["off"]
         )
+    # The extra K stage pays off only on the long, dv-split path in the scan.
+    if PREFETCH_MODE == "auto":
+        prefetch_k = dv_parts > 1 and chunks_per_batch >= 64
+    else:
+        prefetch_k = PREFETCH_MODE == "on"
     recurrent = tilelang_residual_first(
         num_heads_v,
         num_heads_qk,
@@ -300,6 +322,7 @@ def gdn_prefill_forward(
         use_initial_state=use_initial_state,
         dv_tile=dv_tile,
         dv_parts=dv_parts,
+        prefetch_k=prefetch_k,
     )
     recurrent(
         q,
