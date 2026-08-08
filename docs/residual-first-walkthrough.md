@@ -2,8 +2,8 @@
 
 本文讲解当前 [student/tilelang_fwd.py](../student/tilelang_fwd.py) 中默认启用的 residual-first
 实现。目标是同时回答三件事：它在数学上算什么、为什么与实验文档公式等价、每一步最终如何映射到
-当前 GPU kernel。当前版本包含第一项优化：在每个 chunk 的输入准备阶段预计算 `gamma`、
-`1/gamma` 和 `gamma_last`，后续阶段只复用这些线性空间 gate。
+当前 GPU kernel。当前版本包含两项优化：第一，在每个 chunk 的输入准备阶段预计算 `gamma`、
+`1/gamma` 和 `gamma_last`；第二，把独立的 value 列切成多个 `dv` slice，由多个 CTA 并行维护。
 
 ## 1. 问题、形状与符号
 
@@ -13,6 +13,8 @@
 chunk size C = 64
 key/query dimension dk = 128
 value dimension dv = 128
+runtime value tile D in {128, 64, 32}
+dv parts P = dv / D
 ```
 
 对一个 batch `b`、一个 value head `h`、一个 chunk，省略 `b/h/chunk` 下标后：
@@ -240,81 +242,110 @@ S_next = gamma_last * S + K^T @ Z_end
 ```text
 B, T, Hq, Hv
 chunks_per_batch = ceil(T/64)
+state_owners = B * Hv
 ```
 
-它只分配两个 global output：
+它只分配两个 global output，接口 shape 没有因分片而改变：
 
 ```text
 output      [B,T,Hv,128] BF16
 final_state [B,Hv,128,128] FP32
 ```
 
-然后专门化 JIT kernel 的 `H=Hv`、`Hg=Hq`、dtype 和是否存在 initial state。动态维度只有 B/T。
+wrapper 根据实测规则选择 value tile `D` 和 part 数 `P=128/D`：
+
+```text
+if mode == auto
+   and chunks_per_batch >= 64
+   and state_owners < 14
+   and state_owners * 4 <= 28:
+    D = 32, P = 4
+else:
+    D = 128, P = 1
+```
+
+`GDN_DV_SPLIT=off|64|32` 可以强制选择 `128x1/64x2/32x4`，只用于消融测试。JIT kernel
+专门化 `H=Hv`、`Hg=Hq`、dtype、initial-state 分支、`D` 和 `P`；动态维度仍只有 B/T。
 
 实际 launch 是：
 
 ```python
-with T.Kernel(batch_size * H, threads=256) as (block,):
+with T.Kernel(batch_size * H * dv_parts, threads=256) as (block,):
 ```
 
 对应：
 
 ```text
-grid.x  = B * Hv
+grid.x  = B * Hv * P
 block.x = 256 threads = 8 warps
 ```
 
 block 映射：
 
 ```text
-bb  = block // Hv
-bh  = block % Hv
-bhg = bh // (Hv/Hq)
+owner   = block // P
+dv_part = block % P
+bb      = owner // Hv
+bh      = owner % Hv
+bhg     = bh // (Hv/Hq)
+dv_left = dv_part * D
 ```
 
-也就是一个 block 独占一个 `(batch, value_head)` 的完整 `[128,128]` recurrent state，并从第一个
-chunk 串行走到最后一个 chunk。TileLang 把 block 内的 `T.Parallel` 循环迭代分给 256 个物理线程；
-它绝不表示启动 `64*128` 个线程。
+一个 block 独占 `(batch, value_head, dv_part)` 的 `[128,D]` recurrent-state slice，并从第一个
+chunk 串行走到最后一个 chunk。不同 part 写入互不重叠的
+`output[...,dv_left:dv_left+D]` 和 `final_state[...,dv_left:dv_left+D]`，不需要跨 CTA reduction
+或同步。TileLang 把 `T.Parallel` 迭代分给 256 个物理线程，它不表示为每个矩阵 element 启动一个线程。
 
 ## 9. Shared memory 与 fragment
 
-每个 block 分配：
+令当前 CTA 的 value tile 宽度为 `D`。每个 block 分配：
 
-| buffer | shape/dtype | 逻辑大小 | 用途 |
-| --- | --- | ---: | --- |
-| `q_shared` | `[64,128]` BF16 | 16 KiB | Q Tensor Core operand |
-| `k_shared` | `[64,128]` BF16 | 16 KiB | K Tensor Core operand |
-| `v_shared` | `[64,128]` BF16 | 16 KiB | V |
-| `a_shared` | `[64,64]` BF16 | 8 KiB | triangular inverse A |
-| `z_shared` | `[64,128]` BF16 | 16 KiB | R/Z/decayed-Z Tensor Core operand |
-| `state_shared` | `[128,128]` BF16 | 32 KiB | state 的 Tensor Core operand copy |
-| `score_shared` | `[64,64]` BF16 | 8 KiB | causal QK score |
-| `gamma_shared` | `[64]` FP32 | 256 B | 预计算的 `exp(g)` |
-| `inv_gamma_shared` | `[64]` FP32 | 256 B | 预计算的 `1/exp(g)` |
-| `beta_shared` | `[64]` FP32 | 256 B | beta |
-| `gamma_last` | `[1]` FP32 | 4 B | chunk 最后有效 token 的 `exp(g)` |
+| buffer | shape/dtype | 逻辑大小 | 是否随 D 变化 | 用途 |
+| --- | --- | ---: | --- | --- |
+| `q_shared` | `[64,128]` BF16 | 16 KiB | 否 | Q Tensor Core operand |
+| `k_shared` | `[64,128]` BF16 | 16 KiB | 否 | K Tensor Core operand |
+| `v_shared` | `[64,D]` BF16 | `128D` B | 是 | 当前 value-column slice |
+| `a_shared` | `[64,64]` BF16 | 8 KiB | 否 | triangular inverse A |
+| `z_shared` | `[64,D]` BF16 | `128D` B | 是 | R/Z/decayed-Z operand |
+| `state_shared` | `[128,D]` BF16 | `256D` B | 是 | state slice 的 Tensor Core copy |
+| `score_shared` | `[64,64]` BF16 | 8 KiB | 否 | causal QK score |
+| `gamma_shared` | `[64]` FP32 | 256 B | 否 | 预计算的 `exp(g)` |
+| `inv_gamma_shared` | `[64]` FP32 | 256 B | 否 | 预计算的 `1/exp(g)` |
+| `beta_shared` | `[64]` FP32 | 256 B | 否 | beta |
+| `gamma_last` | `[1]` FP32 | 4 B | 否 | 最后有效 token 的 `exp(g)` |
 
-源码层面的逻辑合计为 115,460 B，即约 112.754 KiB；相比未预计算版本增加 256 B。编译器可能再为
-alignment 和内部布局加入 padding，因此这不是 CUDA launch attribute 中的最终静态字节数。
+固定部分为 49,924 B，可变部分为 `512D` B：
+
+| 配置 | source-level shared/block |
+| --- | ---: |
+| `D=128, P=1` | 115,460 B = 112.754 KiB |
+| `D=64, P=2` | 82,692 B = 80.754 KiB |
+| `D=32, P=4` | 66,308 B = 64.754 KiB |
 
 fragment 是分布式 register tile：
 
 ```text
-state [128,128] FP32
-z     [64,128]  FP32
-out   [64,128]  FP32
-score [64,64]   FP32
+state [128,D]  FP32
+z     [64,D]   FP32
+out   [64,D]   FP32
+score [64,64]  FP32
 ```
 
-这些矩阵不会在每个线程里各复制一份。TileLang 根据 GEMM layout 把 fragment element 分布到 warps 和
-threads。gamma 优化没有新增 fragment。优化前 NCU 实测为 200 registers/thread，即 51,200
-registers/block；仅该 register 量就把 residency 限制为 1 block/SM。两个 block 的 source-level
-shared 逻辑大小为约 225.5 KiB，已经非常接近 228 KiB/SM 上限，但能否容纳还取决于 backend padding；
-当前优化后的精确 launch attributes 仍应重新以 NCU 为准。
+source-level fragment 数据总量为 `16 KiB + D KiB`。它们分布在 256 个线程的 registers 中，
+并不是每个线程保存完整 tile。紧邻本次改动的同一 kernel 路径对照如下：
 
-state fragment 一直跨 chunk 保持 FP32；每个 chunk 开头复制为 BF16 `state_shared` 供 Tensor Core
-读取。GEMM accumulation 使用 FP32。Z 在 element-wise/GEMM accumulator 中是 FP32，但复制到
-`z_shared` 时转换为 BF16。这些 dtype 边界是当前实现的数值语义和误差来源之一。
+| 配置 | source fragment/block | NCU registers/thread | source shared/block | NCU dynamic shared/block | blocks/SM 上限 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 修改前 `D=128,P=1` | 144 KiB | 202 | 112.754 KiB | 115.47 KiB | 1 |
+| 消融 `D=64,P=2` | 80 KiB | 未 profile | 80.754 KiB | 未 profile | 未 profile |
+| 当前 split `D=32,P=4` | 48 KiB | 104 | 64.754 KiB | 66.32 KiB | 2 |
+
+source 数字只统计显式 buffer；NCU 数字包含 backend layout/alignment，并反映编译后的寄存器
+liveness，因此两列不应直接换算。以后每版同时报告这两种口径。
+
+state fragment 跨 chunk 保持 FP32；每个 chunk 开头复制为 BF16 `state_shared`。Z/out GEMM
+accumulation 使用 FP32，`z_shared` 和 `score_shared` 是 BF16 operand 边界。这些 dtype 转换没有
+因 dv 分片而改变。
 
 ## 10. 一个 chunk 的实际执行顺序
 
@@ -323,16 +354,17 @@ state fragment 一直跨 chunk 保持 FP32；每个 chunk 开头复制为 BF16 `
 第一次进入 kernel：
 
 ```text
-有 initial_state: global FP32 -> state fragment
-无 initial_state: clear state fragment to zero
+有 initial_state: global FP32 state[...,dv_left:dv_left+D] -> state fragment
+无 initial_state: clear [128,D] state fragment to zero
 ```
 
 每个 chunk 开头：
 
 ```text
-state fragment FP32 -> state_shared BF16
-global Q/K/V/A BF16  -> corresponding shared buffers
-global g/beta FP32   -> register/shared preparation path
+state fragment [128,D] FP32 -> state_shared [128,D] BF16
+global Q/K/A BF16            -> full shared tiles (duplicated by every part)
+global V[...,dv_left:+D]      -> v_shared [64,D] (partitioned)
+global g/beta FP32            -> shared gate vectors (duplicated by every part)
 gamma_shared[i]      = exp2(global_g[i] * LOG2E)
 inv_gamma_shared[i]  = 1 / gamma_shared[i]
 gamma_last           = gamma_shared[63] or exp2(global tail g * LOG2E)
@@ -340,14 +372,15 @@ gamma_last           = gamma_shared[63] or exp2(global tail g * LOG2E)
 
 `state` 使用 `T.copy`，Q/K/V/A/g/beta 使用 `T.Parallel`。这里没有 `T.async_copy`、TMA、
 `T.Pipelined`、double buffer 或跨 chunk prefetch；所有当前 chunk 的装载和 gate 预计算结束后才开始
-GEMM 1。尾块将无效 Q/K/V/A row 填零，将无效 `gamma/inv_gamma` 设为 1、`beta` 设为 0。
-`gamma_last` 始终对应最后一个有效 token，而不是无条件读取 row 63。
+GEMM 1。这里仍然没有跨 chunk prefetch。拆分后 Q/K/A/g/beta 和 gate 预计算会被每个 part 重复，
+V/state/output/final_state 则按 value 列分片。尾块将无效 Q/K/V/A row 填零，将无效
+`gamma/inv_gamma` 设为 1、`beta` 设为 0；`gamma_last` 始终对应最后一个有效 token。
 
 ### 10.2 GEMM 1：用 K 从旧 state 读取预测
 
 ```text
 z = K @ S
-[64,128] x [128,128] -> [64,128]
+[64,128] x [128,D] -> [64,D]
 ```
 
 代码是：
@@ -371,7 +404,7 @@ z_i = beta_i * (v_i - gamma_i * z_i)
 
 ```text
 z = A @ R
-[64,64] x [64,128] -> [64,128]
+[64,64] x [64,D] -> [64,D]
 ```
 
 这一步之后 z 才是公式中的 Z。再次写到 `z_shared`，后面的 output 和 state update 都复用它。
@@ -380,7 +413,7 @@ z = A @ R
 
 ```text
 out = Q @ S
-[64,128] x [128,128] -> [64,128]
+[64,128] x [128,D] -> [64,D]
 out_i *= scale * gamma_i
 ```
 
@@ -408,11 +441,11 @@ else:
 
 ```text
 out += score @ Z
-[64,64] x [64,128] -> [64,128]
+[64,64] x [64,D] -> [64,D]
 ```
 
 代码使用 `clear_accum=False`，因此保留 GEMM 3 已经放在 out accumulator 中的旧 state contribution。
-有效 row 最后写入 global BF16 output。
+有效 row 最后写入 global BF16 `output[...,dv_left:dv_left+D]`。
 
 ### 10.8 Element-wise：把旧 state 衰减到 chunk 末尾
 
@@ -421,7 +454,7 @@ state *= gamma_last
 ```
 
 state fragment 仍为 FP32。`gamma_last` 已在 chunk 准备阶段形成一个 FP32 shared 标量，
-`[128,128]` 的 `T.Parallel` 循环只读取并乘上该值，不再重复执行 `exp2`。
+`[128,D]` 的 `T.Parallel` 循环只读取并乘上该值，不再重复执行 `exp2`。
 
 ### 10.9 Element-wise：把 Z 衰减到 chunk 末尾
 
@@ -435,11 +468,12 @@ z_i *= gamma_last * inv_gamma_i
 
 ```text
 state += K^T @ z
-[128,64] x [64,128] -> [128,128]
+[128,64] x [64,D] -> [128,D]
 ```
 
 这里同样使用 `clear_accum=False`，把 rank-64 chunk update 累加到已经衰减的 FP32 state fragment。
-随后进入下一个 `T.serial` chunk。所有 chunk 完成后才把 state 写到 global FP32 `final_state`。
+随后进入下一个 `T.serial` chunk。所有 chunk 完成后，CTA 才把自己的 `[128,D]` state slice
+写到 global FP32 `final_state[...,dv_left:dv_left+D]`。
 
 ## 11. 为什么 chunks 串行、chunk 内并行
 
@@ -449,8 +483,9 @@ state += K^T @ z
 S_(c+1) depends on S_c
 ```
 
-因此当前一个 block 内的 chunk loop 不能简单换成 `T.Parallel` 或 `T.Pipelined` 后同时计算多个完整
-chunk。尤其 GEMM 1 (`K@S`) 和 GEMM 3 (`Q@S`) 必须等当前 `S` 可用。
+因此每个 `(batch, head, dv_part)` block 内的 chunk loop 不能简单换成 `T.Parallel` 或
+`T.Pipelined` 后同时计算多个完整 chunk。dv 分片只并行独立的 value 列；GEMM 1 (`K@S`) 和
+GEMM 3 (`Q@S`) 仍必须等待本 part 的当前 `S`。
 
 可以提前并行/流水的是：
 
@@ -463,29 +498,38 @@ load Q_(c+1), K_(c+1), V_(c+1), A_(c+1), g_(c+1), beta_(c+1)
 
 ## 12. 精确的计算量
 
-每 chunk/head 六次 GEMM：
+令一个 CTA 的 value tile 为 `D`，每个 head 有 `P=128/D` 个 CTA。单个 CTA 每 chunk 的六次 GEMM：
 
-| GEMM | MACs |
+| GEMM | MACs/CTA |
 | --- | ---: |
-| `K @ S` | `C*dk*dv` |
-| `A @ R` | `C^2*dv` |
-| `Q @ S` | `C*dk*dv` |
+| `K @ S` | `C*dk*D` |
+| `A @ R` | `C^2*D` |
+| `Q @ S` | `C*dk*D` |
 | `Q @ K^T` | `C^2*dk` |
-| `score @ Z` | `C^2*dv` |
-| `K^T @ Z` | `C*dk*dv` |
+| `score @ Z` | `C^2*D` |
+| `K^T @ Z` | `C*dk*D` |
 
-合计：
+因此：
 
 ```text
-3*C*dk*dv + C^2*dk + 2*C^2*dv
-= 4,718,592 MAC/chunk/head
-= 9,437,184 FLOP/chunk/head（每 MAC 按 2 FLOP）
+MAC/CTA/chunk  = 3*C*dk*D + C^2*dk + 2*C^2*D
+MAC/head/chunk = P * MAC/CTA/chunk
+               = 3*C*dk*dv + 2*C^2*dv + P*C^2*dk
 ```
 
-还没有计入 exp2、reciprocal、乘法、mask、copy、dtype conversion、synchronization 和尾块 predicate。
-对一个完整 chunk/head，按源码循环的逻辑 element 数计，gamma 优化前后为：
+value-dependent work总量不变，只有 `Q@K^T` 被每个 part 重复：
 
-| gate 操作位置 | 优化前 | 优化后 |
+| 配置 | MAC/CTA/chunk | MAC/head/chunk | 相对额外 MAC |
+| --- | ---: | ---: | ---: |
+| `D=128,P=1` | 4,718,592 | 4,718,592 | 0% |
+| `D=64,P=2` | 2,621,440 | 5,242,880 | 11.1% |
+| `D=32,P=4` | 1,572,864 | 6,291,456 | 33.3% |
+
+gamma 操作也会按 P 重复。下表是未拆分 `D=128,P=1` 时，一个完整 chunk/head 的源码逻辑
+element 数；拆分时把每个 value-dependent 行按 `D/128` 缩小后再乘 P，总量不变，而 score 和 chunk
+准备行会乘 P：
+
+| gate 操作位置 | gamma 优化前 | gamma 优化后 |
 | --- | ---: | ---: |
 | residual `gamma_i` | 8,192 次 `exp2` | 8,192 次 shared read/multiply |
 | output state contribution `gamma_i` | 8,192 次 `exp2` | 8,192 次 shared read/multiply |
@@ -494,8 +538,8 @@ load Q_(c+1), K_(c+1), V_(c+1), A_(c+1), g_(c+1), beta_(c+1)
 | Z decay ratio | 8,192 次 `exp2` | 8,192 次 `gamma_last*inv_gamma` |
 | chunk 准备 | 0 | 64 次 `exp2` + 64 次 reciprocal |
 
-即源码层面把完整 chunk 的最多 43,040 次重复 `exp2` 表达式收敛为 64 次 `exp2` 和 64 次 reciprocal。
-编译器可能对旧表达式做部分 CSE/hoist，所以这不是 SASS 指令数；实际收益必须以 benchmark/profile 为准。
+因此 dv split 是用重复的 QK/gate/A/Q/K global work 换取更多 CTA 和更小的 register/shared footprint，
+只应在原 grid 严重不足且 chunk 链足够长时启用。
 
 ## 13. 优化前 profile 揭示的执行状态
 
@@ -512,13 +556,14 @@ MIG SMs = 14
 
 - 只有 8 个 SM 能拿到 block，另外 6 个 SM 从头到尾空闲。
 - 每个 block 串行做 512 个 chunks，每 chunk 六次 GEMM。
-- 优化前的 200 registers/thread 和约 113.5 KiB shared memory 都限制为 1 block/SM。
+- 该较早 profile 中 registers 和 shared memory 都把 residency 限制为 1 block/SM；紧邻 dv split
+  版本的精确资源对照见第 9 节。
 - achieved occupancy 为 12.51%，waves/SM 为 0.57。
 - kernel 约 3.845 ms；DRAM 约 52.5 GB/s，只达到实例 peak 的约 20.6%。
 - memory-pipeline utilization 高于 compute，但两者都远未饱和；根因首先是 grid 太小和长 state chain。
 
-因此“再减少一点 global load”或“把 occupancy 数字提高”不一定直接解决 low-head case。要让 14 个 SM
-都工作，需要改变 state owner 的 block 分解，或得到能跨 chunk/子块并行组合的数学形式。
+dv 分片正是对 state owner 的 block 分解，但 profile 也说明不能只追求更多 block：owner=8 时强制
+拆分会因重复 QK/A/gate 工作而显著退化，所以最终必须按 owner 数和 chunk 链长度选择性启用。
 
 ## 14. 优化 1：预计算 gamma、1/gamma 与 gamma_last
 
@@ -571,18 +616,103 @@ p > 1:          score = min(120, 100 + 20 * (p-1))
 收益不如源码层面的 `exp2` 数量降幅大，说明六次 Tensor Core GEMM、shared/register movement 以及
 编译器原有的部分公共子表达式处理仍占主要时间。
 
-## 15. 从当前代码出发的优化检查表
+## 15. 优化 2：沿 dv 拆分 recurrent state
+
+### 15.1 独立性与实现
+
+固定一个 `(batch, value_head)` 后，state 的每个 value 列只参与同列的 `K@S`、residual、
+`A@R`、`Q@S`、`score@Z` 和 `K^T@Z`。不同列之间没有 reduction 或数据依赖，因此可以把
+`dv=128` 切成 P 个连续 slice：
+
+```text
+CTA p owns columns [p*D, (p+1)*D)
+state fragment/shared = [128,D]
+V/Z/out                = [64,D]
+```
+
+Q/K/A、score 和 gate 与 value 列无关，但为了避免 CTA 间同步，它们由每个 part 独立加载和计算。
+initial state、V、output 和 final state 按 `dv_left` 切片，所有 global writes 都是 disjoint 的。
+
+自动分派选择 `D=32,P=4` 的条件是：chunk 数至少 64、原 state owner 少于 14，并且拆后 grid 不超过
+28 blocks；其余情况使用 `D=128,P=1`。这不是对公开 case 名称的硬编码，而是针对 H800 MIG 14 SM
+和重复计算成本的 shape 规则。
+
+### 15.2 并行度扫描
+
+第一轮使用 5 warmups、20 repetitions，覆盖 initial-state+尾块、4-owner MHA 和 8-owner GVA：
+
+| 配置 | `short_tail_state` ms | `chain_equal` ms | `long_low_gva` ms | 结论 |
+| --- | ---: | ---: | ---: | --- |
+| `D=128,P=1` | 0.145632 | 0.938128 | 3.803824 | 基准 |
+| `D=64,P=2` | 0.235648 | 0.887072 | 6.712880 | chain 小幅受益，其余显著退化 |
+| `D=32,P=4` | 0.215920 | 0.807248 | 6.587808 | chain 最优，其余显著退化 |
+| `D=16,P=8` | FAIL | FAIL | FAIL | 默认 fragment layout 在 N=16 时结果错误，移除 |
+
+对 `chain_equal` 再用正式 10/100 协议复测：
+
+| 配置 | grid blocks | median ms | 相对 `128x1` |
+| --- | ---: | ---: | ---: |
+| `128x1` | 4 | 0.925408 | 1.0000x |
+| `64x2` | 8 | 0.876640 | 1.0556x |
+| `32x4` | 16 | 0.793184 | **1.1667x** |
+
+`32x4` 最好，因为它把 4-block grid 扩到 16 blocks，基本覆盖 14 个 SM；继续缩到 N=16 不仅增加
+重复工作，当前 TileLang layout 也不满足正确性。
+
+原始扫描日志为 `output/dv_split_scan_{off,64,32,16}_*.log`，正式 chain 日志为
+`output/dv_split_chain_{off,64,32}_*.log`。
+
+### 15.3 NCU 资源验证
+
+对 `chain_equal` 的修改前 `residual_mha_dv128x1` 和当前 `residual_mha_dv32x4` 进行 NCU basic
+profile，二者使用相同的 256-thread block：
+
+| 指标 | 修改前 `D=128,P=1` | 当前 `D=32,P=4` |
+| --- | ---: | ---: |
+| grid blocks | 4 | 16 |
+| registers/thread | 202 | 104 |
+| dynamic shared/block | 115.47 KiB | 66.32 KiB |
+| theoretical blocks/SM | 1 | 2 |
+| theoretical occupancy | 12.50% | 25.00% |
+| achieved occupancy | 12.50% | 14.34% |
+| achieved active warps/SM | 8.00 | 9.18 |
+| profiled duration | 0.912 ms | 0.770 ms |
+| compute / memory throughput | 6.20% / 17.74% | 20.25% / 42.48% |
+
+报告分别保存在 `output/ncu_dv_split_off_chain.ncu-rep` 和 `output/ncu_dv_split_chain.ncu-rep`。
+grid 从 4 增到 16 是主要收益来源；寄存器和 shared 缩小也把理论 residency 从 1 block/SM 提到 2，
+但本 case 只有 16 blocks，尚不足以在所有 14 个 SM 同时放满两块。
+
+### 15.4 最终 8-case 结果
+
+下面以优化 1 的 gamma-precompute 版本为 baseline。最终自动分派使用默认 10 warmups、100
+repetitions，所有 output/final-state 正确性检查均通过：
+
+| case | gamma baseline ms | dv auto ms | speedup | `p=t100/t` | 预计分数 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `short_tail_state` | 0.144288 | 0.144560 | 0.9981x | 2.3938 | 120.00 |
+| `chain_equal` | 0.922480 | 0.792768 | **1.1636x** | 0.6279 | 83.00 |
+| `parallel_equal` | 0.545008 | 0.550848 | 0.9894x | 0.9281 | 96.15 |
+| `parallel_gva` | 0.495856 | 0.497872 | 0.9960x | 0.9873 | 99.31 |
+| `long_low_gva` | 3.676608 | 3.672976 | 1.0010x | 0.5061 | 77.61 |
+| `batch_split_gva` | 2.829680 | 2.834256 | 0.9984x | 0.5406 | 78.75 |
+| `wide_gva_state` | 5.085760 | 5.091840 | 0.9988x | 0.4766 | 76.27 |
+| `deep_gva_state` | 5.777808 | 5.791568 | 0.9976x | 0.4888 | 76.64 |
+
+预计分数沿用优化 1 中声明的分段线性估算。公开 8 case 的预计简单平均从 88.07 提升到
+**88.47 分**；未选择 split 的 case 变化在约 -1.1% 到 +0.1%，属于跨任务时钟/测量波动范围。
+最终完整日志为 `output/dv_split_auto_final_56860.log`。
+
+## 16. 从当前代码出发的优化检查表
 
 1. 下一 chunk 的 global-to-shared load 能否用 `T.Pipelined`/async copy/TMA 与当前 GEMM 重叠？
 2. ping-pong buffer 增加的 shared memory 是否仍允许目标 occupancy？
 3. `q/k/v/a/z/score/state` 的 shared layout 是否存在 bank conflict 或 Tensor Core operand replay？
-4. TileLang 对六次 `T.gemm` 各自生成了 `mma` 还是 `wgmma`，shape 是否充分利用 N>=64 的 Hopper
+4. TileLang 对六次 `T.gemm` 各自生成了 `mma` 还是 `wgmma`，shape 是否充分利用 N>=32 的 Hopper
    Tensor Core throughput？
 5. `state FP32 fragment -> BF16 shared` 每 chunk 的 conversion/copy 能否减少或与其他操作重叠？
-6. GVA 中同一个 Q/K head 被多个 value heads 重复加载，能否利用 L2、cluster DSM 或调整 block ownership？
-7. 对 `B*Hv < 14` 的 case，能否把一个 state 的 dv/dk tile 拆给多个 cooperating blocks？同步和 reduction
-   成本是否小于多用 SM 的收益？
-8. 对 `B*Hv >= 14` 的 case，降低 registers/shared 以允许更多 blocks/SM 是否真正改善 stall reason？
+6. GVA 中同一个 Q/K head 被多个 value heads/parts 重复加载，能否利用 L2、cluster DSM 或调整 ownership？
+7. 对 `B*Hv >= 14` 的 case，降低 registers/shared 以允许更多 blocks/SM 是否真正改善 stall reason？
 
 这些项目分别对应 pipeline、shared-memory capacity/layout、Tensor Core、GVA reuse 和 grid-level
 parallelism。后续每次改动都应先明确它针对哪一项，再用相同 case 的 benchmark 与 NCU/NSYS 数据验证。

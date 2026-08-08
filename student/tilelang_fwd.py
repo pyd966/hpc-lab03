@@ -11,9 +11,16 @@ from student.tilelang_fwd_document import gdn_prefill_forward_document
 CHUNK_SIZE = 64
 HEAD_DIM_K = 128
 HEAD_DIM_V = 128
+MIG_SM_COUNT = 14
 LOG2E = 1.4426950408889634
 SCALE = HEAD_DIM_K**-0.5
 USE_DOCUMENT_FORM = os.environ.get("GDN_IMPL", "residual") == "document"
+DV_SPLIT_MODE = os.environ.get("GDN_DV_SPLIT", "auto")
+DV_SPLIT_CONFIGS = {
+    "off": (HEAD_DIM_V, 1),
+    "64": (64, 2),
+    "32": (32, 4),
+}
 
 
 @tilelang.jit(
@@ -29,6 +36,8 @@ def tilelang_residual_first(
     gate_dtype,
     accum_dtype,
     use_initial_state,
+    dv_tile,
+    dv_parts,
 ):
     batch_size = T.dynamic("batch_size")
     num_tokens = T.dynamic("num_tokens")
@@ -38,6 +47,15 @@ def tilelang_residual_first(
     a_shape = (batch_size, num_tokens, H, CHUNK_SIZE)
     state_shape = (batch_size, H, HEAD_DIM_K, HEAD_DIM_V)
     initial_shape = state_shape if use_initial_state else (1,)
+    attention_name = "gva" if H != Hg else "mha"
+    kernel_name = (
+        "residual_"
+        + attention_name
+        + "_dv"
+        + str(dv_tile)
+        + "x"
+        + str(dv_parts)
+    )
 
     @T.prim_func
     def kernel(
@@ -52,19 +70,23 @@ def tilelang_residual_first(
         final_state: T.Tensor(state_shape, dtype=accum_dtype),
         chunks_per_batch: T.int32,
     ):
-        # One block owns one recurrent state; chunks must be traversed serially.
-        with T.Kernel(batch_size * H, threads=256) as (block,):
-            bb = block // H
-            bh = block % H
+        T.func_attr({"global_symbol": kernel_name})
+        # Value columns are independent; each block owns one state slice.
+        with T.Kernel(batch_size * H * dv_parts, threads=256) as (block,):
+            owner = block // dv_parts
+            dv_part = block % dv_parts
+            bb = owner // H
+            bh = owner % H
             bhg = bh // (H // Hg)
+            dv_left = dv_part * dv_tile
 
             q_shared = T.alloc_shared((CHUNK_SIZE, HEAD_DIM_K), dtype=qk_dtype)
             k_shared = T.alloc_shared((CHUNK_SIZE, HEAD_DIM_K), dtype=qk_dtype)
-            v_shared = T.alloc_shared((CHUNK_SIZE, HEAD_DIM_V), dtype=v_dtype)
+            v_shared = T.alloc_shared((CHUNK_SIZE, dv_tile), dtype=v_dtype)
             a_shared = T.alloc_shared((CHUNK_SIZE, CHUNK_SIZE), dtype=qk_dtype)
-            z_shared = T.alloc_shared((CHUNK_SIZE, HEAD_DIM_V), dtype=v_dtype)
+            z_shared = T.alloc_shared((CHUNK_SIZE, dv_tile), dtype=v_dtype)
             state_shared = T.alloc_shared(
-                (HEAD_DIM_K, HEAD_DIM_V), dtype=v_dtype
+                (HEAD_DIM_K, dv_tile), dtype=v_dtype
             )
             score_shared = T.alloc_shared(
                 (CHUNK_SIZE, CHUNK_SIZE), dtype=qk_dtype
@@ -75,16 +97,24 @@ def tilelang_residual_first(
             gamma_last = T.alloc_shared((1,), dtype=gate_dtype)
 
             state = T.alloc_fragment(
-                (HEAD_DIM_K, HEAD_DIM_V), dtype=accum_dtype
+                (HEAD_DIM_K, dv_tile), dtype=accum_dtype
             )
-            z = T.alloc_fragment((CHUNK_SIZE, HEAD_DIM_V), dtype=accum_dtype)
-            out = T.alloc_fragment((CHUNK_SIZE, HEAD_DIM_V), dtype=accum_dtype)
+            z = T.alloc_fragment((CHUNK_SIZE, dv_tile), dtype=accum_dtype)
+            out = T.alloc_fragment((CHUNK_SIZE, dv_tile), dtype=accum_dtype)
             score = T.alloc_fragment(
                 (CHUNK_SIZE, CHUNK_SIZE), dtype=accum_dtype
             )
 
             if use_initial_state:
-                T.copy(initial_state[bb, bh, 0:HEAD_DIM_K, 0:HEAD_DIM_V], state)
+                T.copy(
+                    initial_state[
+                        bb,
+                        bh,
+                        0:HEAD_DIM_K,
+                        dv_left : dv_left + dv_tile,
+                    ],
+                    state,
+                )
             else:
                 T.clear(state)
 
@@ -97,11 +127,15 @@ def tilelang_residual_first(
                     if left + token < num_tokens:
                         q_shared[token, dim] = q[bb, left + token, bhg, dim]
                         k_shared[token, dim] = k[bb, left + token, bhg, dim]
-                        v_shared[token, dim] = v[bb, left + token, bh, dim]
+                        if dim < dv_tile:
+                            v_shared[token, dim] = v[
+                                bb, left + token, bh, dv_left + dim
+                            ]
                     else:
                         q_shared[token, dim] = 0
                         k_shared[token, dim] = 0
-                        v_shared[token, dim] = 0
+                        if dim < dv_tile:
+                            v_shared[token, dim] = 0
                 for row, col in T.Parallel(CHUNK_SIZE, CHUNK_SIZE):
                     if left + row < num_tokens:
                         a_shared[row, col] = a[bb, left + row, bh, col]
@@ -129,7 +163,7 @@ def tilelang_residual_first(
                 #   R = beta * (V - exp(g) * K @ S)
                 #   Z = A @ R
                 T.gemm(k_shared, state_shared, z, clear_accum=True)
-                for token, dim in T.Parallel(CHUNK_SIZE, HEAD_DIM_V):
+                for token, dim in T.Parallel(CHUNK_SIZE, dv_tile):
                     if left + token < num_tokens:
                         z[token, dim] = beta_shared[token] * (
                             v_shared[token, dim]
@@ -143,7 +177,7 @@ def tilelang_residual_first(
 
                 # Contribution from the state at the start of the chunk.
                 T.gemm(q_shared, state_shared, out, clear_accum=True)
-                for token, dim in T.Parallel(CHUNK_SIZE, HEAD_DIM_V):
+                for token, dim in T.Parallel(CHUNK_SIZE, dv_tile):
                     out[token, dim] *= SCALE * gamma_shared[token]
 
                 # Causal in-chunk contribution: tril(Q K^T * decay) @ Z.
@@ -166,14 +200,16 @@ def tilelang_residual_first(
                 T.copy(score, score_shared)
                 T.gemm(score_shared, z_shared, out, clear_accum=False)
 
-                for token, dim in T.Parallel(CHUNK_SIZE, HEAD_DIM_V):
+                for token, dim in T.Parallel(CHUNK_SIZE, dv_tile):
                     if left + token < num_tokens:
-                        output[bb, left + token, bh, dim] = out[token, dim]
+                        output[
+                            bb, left + token, bh, dv_left + dim
+                        ] = out[token, dim]
 
                 # S' = gamma_last * S + K^T @ ((gamma_last / gamma_i) * Z_i).
-                for dim_k, dim_v in T.Parallel(HEAD_DIM_K, HEAD_DIM_V):
+                for dim_k, dim_v in T.Parallel(HEAD_DIM_K, dv_tile):
                     state[dim_k, dim_v] *= gamma_last[0]
-                for token, dim in T.Parallel(CHUNK_SIZE, HEAD_DIM_V):
+                for token, dim in T.Parallel(CHUNK_SIZE, dv_tile):
                     z[token, dim] *= (
                         gamma_last[0] * inv_gamma_shared[token]
                     )
@@ -186,7 +222,15 @@ def tilelang_residual_first(
                     clear_accum=False,
                 )
 
-            T.copy(state, final_state[bb, bh, 0:HEAD_DIM_K, 0:HEAD_DIM_V])
+            T.copy(
+                state,
+                final_state[
+                    bb,
+                    bh,
+                    0:HEAD_DIM_K,
+                    dv_left : dv_left + dv_tile,
+                ],
+            )
 
     return kernel
 
@@ -230,6 +274,22 @@ def gdn_prefill_forward(
     use_initial_state = initial_state is not None
     if initial_state is None:
         initial_state = torch.empty((1,), dtype=torch.float32, device=v.device)
+    if DV_SPLIT_MODE == "auto":
+        state_owners = batch_size * num_heads_v
+        split_profitable = (
+            chunks_per_batch >= 64
+            and state_owners < MIG_SM_COUNT
+            and state_owners * 4 <= 2 * MIG_SM_COUNT
+        )
+        dv_tile, dv_parts = (
+            DV_SPLIT_CONFIGS["32"]
+            if split_profitable
+            else DV_SPLIT_CONFIGS["off"]
+        )
+    else:
+        dv_tile, dv_parts = DV_SPLIT_CONFIGS.get(
+            DV_SPLIT_MODE, DV_SPLIT_CONFIGS["off"]
+        )
     recurrent = tilelang_residual_first(
         num_heads_v,
         num_heads_qk,
@@ -238,6 +298,8 @@ def gdn_prefill_forward(
         gate_dtype=g_cumsum.dtype,
         accum_dtype="float32",
         use_initial_state=use_initial_state,
+        dv_tile=dv_tile,
+        dv_parts=dv_parts,
     )
     recurrent(
         q,
