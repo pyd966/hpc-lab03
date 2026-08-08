@@ -2,7 +2,8 @@
 
 本文讲解当前 [student/tilelang_fwd.py](../student/tilelang_fwd.py) 中默认启用的 residual-first
 实现。目标是同时回答三件事：它在数学上算什么、为什么与实验文档公式等价、每一步最终如何映射到
-当前 GPU kernel。
+当前 GPU kernel。当前版本包含第一项优化：在每个 chunk 的输入准备阶段预计算 `gamma`、
+`1/gamma` 和 `gamma_last`，后续阶段只复用这些线性空间 gate。
 
 ## 1. 问题、形状与符号
 
@@ -22,7 +23,8 @@ value dimension dv = 128
 | `K` | `[C, dk]` | BF16 | 当前 chunk key，已 L2 normalize |
 | `V` | `[C, dv]` | BF16 | 当前 chunk value |
 | `g` | `[C]` | FP32 | `log(gamma)`，chunk-local gate prefix sum |
-| `gamma=exp(g)` | `[C]` | 不显式全局存储 | 从 chunk 开头到各 token 的累计 decay |
+| `gamma=exp(g)` | `[C]` | FP32 shared | 从 chunk 开头到各 token 的累计 decay |
+| `inv_gamma=1/gamma` | `[C]` | FP32 shared | gate ratio 的复用因子 |
 | `beta` | `[C]` | FP32 | delta write strength |
 | `A` | `[C, C]` | BF16 | KKT 单位下三角矩阵的逆 |
 | `S` | `[dk, dv]` | FP32 | 进入当前 chunk 时的 recurrent state |
@@ -90,13 +92,19 @@ gamma_i / gamma_j = exp(g_i - g_j)
 ```
 
 表示同一个 chunk 内从 token `j` 到 token `i` 的累计 decay。使用 log-space 是为了把很多小于 1 的
-乘法变成稳定的加法。kernel 收到的是 `g`，需要时用：
+乘法变成稳定的加法。kernel 收到的是 `g`，但当前版本在 chunk 开头统一执行：
 
 ```text
-exp(g) = exp2(g * log2(e))
+gamma_i     = exp2(g_i * log2(e))
+inv_gamma_i = 1 / gamma_i
+gamma_last  = gamma_(last valid token)
 ```
 
-代码中的 `LOG2E` 和 `T.exp2` 就是在做这件事。
+完整 chunk 的 `gamma_last` 直接读取 `gamma_shared[63]`；尾块为避免动态 shared-memory 下标的
+静态越界警告，从最后一个全局 `g` 额外计算一次 `exp2`。这次额外计算每个 `(batch, head)` 最多发生
+一次。代码中的 `LOG2E` 和 `T.exp2` 就是在做 `exp(g)`；后续所需的
+`exp(g_i-g_j)` 和 `exp(g_last-g_i)` 分别改写为 `gamma_i*inv_gamma_j` 和
+`gamma_last*inv_gamma_i`。
 
 ## 4. A 在修正什么
 
@@ -281,11 +289,13 @@ chunk 串行走到最后一个 chunk。TileLang 把 block 内的 `T.Parallel` �
 | `z_shared` | `[64,128]` BF16 | 16 KiB | R/Z/decayed-Z Tensor Core operand |
 | `state_shared` | `[128,128]` BF16 | 32 KiB | state 的 Tensor Core operand copy |
 | `score_shared` | `[64,64]` BF16 | 8 KiB | causal QK score |
-| `g_shared` | `[64]` FP32 | 256 B | log gamma |
+| `gamma_shared` | `[64]` FP32 | 256 B | 预计算的 `exp(g)` |
+| `inv_gamma_shared` | `[64]` FP32 | 256 B | 预计算的 `1/exp(g)` |
 | `beta_shared` | `[64]` FP32 | 256 B | beta |
-| `g_last` | `[1]` FP32 | 4 B | chunk 最后有效 gate |
+| `gamma_last` | `[1]` FP32 | 4 B | chunk 最后有效 token 的 `exp(g)` |
 
-逻辑合计约 112.5 KiB；对齐和 driver reservation 后 NCU 报告 116,240 B/block。
+源码层面的逻辑合计为 115,460 B，即约 112.754 KiB；相比未预计算版本增加 256 B。编译器可能再为
+alignment 和内部布局加入 padding，因此这不是 CUDA launch attribute 中的最终静态字节数。
 
 fragment 是分布式 register tile：
 
@@ -297,8 +307,10 @@ score [64,64]   FP32
 ```
 
 这些矩阵不会在每个线程里各复制一份。TileLang 根据 GEMM layout 把 fragment element 分布到 warps 和
-threads。最终 NCU 实测为 200 registers/thread，即 51,200 registers/block。register 和 shared
-memory 都把 residency 限制为 1 block/SM。
+threads。gamma 优化没有新增 fragment。优化前 NCU 实测为 200 registers/thread，即 51,200
+registers/block；仅该 register 量就把 residency 限制为 1 block/SM。两个 block 的 source-level
+shared 逻辑大小为约 225.5 KiB，已经非常接近 228 KiB/SM 上限，但能否容纳还取决于 backend padding；
+当前优化后的精确 launch attributes 仍应重新以 NCU 为准。
 
 state fragment 一直跨 chunk 保持 FP32；每个 chunk 开头复制为 BF16 `state_shared` 供 Tensor Core
 读取。GEMM accumulation 使用 FP32。Z 在 element-wise/GEMM accumulator 中是 FP32，但复制到
@@ -320,11 +332,16 @@ state fragment 一直跨 chunk 保持 FP32；每个 chunk 开头复制为 BF16 `
 ```text
 state fragment FP32 -> state_shared BF16
 global Q/K/V/A BF16  -> corresponding shared buffers
-global g/beta FP32   -> shared vectors
+global g/beta FP32   -> register/shared preparation path
+gamma_shared[i]      = exp2(global_g[i] * LOG2E)
+inv_gamma_shared[i]  = 1 / gamma_shared[i]
+gamma_last           = gamma_shared[63] or exp2(global tail g * LOG2E)
 ```
 
-当前实现使用 `T.copy` 和 `T.Parallel`，没有显式 async copy 或 double buffer。尾块将无效 Q/K/V/A
-row 填零，g/beta 也填零。`g_last` 取最后一个有效 token，而不是固定取 row 63。
+`state` 使用 `T.copy`，Q/K/V/A/g/beta 使用 `T.Parallel`。这里没有 `T.async_copy`、TMA、
+`T.Pipelined`、double buffer 或跨 chunk prefetch；所有当前 chunk 的装载和 gate 预计算结束后才开始
+GEMM 1。尾块将无效 Q/K/V/A row 填零，将无效 `gamma/inv_gamma` 设为 1、`beta` 设为 0。
+`gamma_last` 始终对应最后一个有效 token，而不是无条件读取 row 63。
 
 ### 10.2 GEMM 1：用 K 从旧 state 读取预测
 
@@ -344,10 +361,11 @@ T.gemm(k_shared, state_shared, z, clear_accum=True)
 ### 10.3 Element-wise：形成 raw residual R
 
 ```text
-z_i = beta_i * (v_i - exp(g_i) * z_i)
+z_i = beta_i * (v_i - gamma_i * z_i)
 ```
 
-现在 z fragment 被原地改写为 R。随后复制到 BF16 `z_shared`，作为下一次 Tensor Core GEMM operand。
+这里的 `gamma_i` 读取 `gamma_shared`，不再执行 `exp2`。z fragment 被原地改写为 R，随后转换并复制
+到 BF16 `z_shared`，作为下一次 Tensor Core GEMM operand。
 
 ### 10.4 GEMM 2：用 A 修正 chunk 内因果反馈
 
@@ -363,7 +381,7 @@ z = A @ R
 ```text
 out = Q @ S
 [64,128] x [128,128] -> [64,128]
-out_i *= scale * exp(g_i)
+out_i *= scale * gamma_i
 ```
 
 `out` 是 FP32 accumulator，此时只包含 chunk 入口 state 的贡献。
@@ -379,7 +397,7 @@ score = Q @ K^T
 
 ```text
 if row >= col:
-    score[row,col] *= scale * exp(g[row]-g[col])
+    score[row,col] *= scale * gamma[row] * inv_gamma[col]
 else:
     score[row,col] = 0
 ```
@@ -399,16 +417,16 @@ out += score @ Z
 ### 10.8 Element-wise：把旧 state 衰减到 chunk 末尾
 
 ```text
-state *= exp(g_last)
+state *= gamma_last
 ```
 
-state fragment 仍为 FP32。代码当前在 `[128,128]` 的 `T.Parallel` 循环表达这个操作；应检查生成代码
-是否将相同的 `exp(g_last)` 提升复用，否则会产生大量重复 SFU 工作。
+state fragment 仍为 FP32。`gamma_last` 已在 chunk 准备阶段形成一个 FP32 shared 标量，
+`[128,128]` 的 `T.Parallel` 循环只读取并乘上该值，不再重复执行 `exp2`。
 
 ### 10.9 Element-wise：把 Z 衰减到 chunk 末尾
 
 ```text
-z_i *= exp(g_last - g_i)
+z_i *= gamma_last * inv_gamma_i
 ```
 
 然后将 decayed Z 转为 BF16 `z_shared`。
@@ -464,9 +482,22 @@ load Q_(c+1), K_(c+1), V_(c+1), A_(c+1), g_(c+1), beta_(c+1)
 = 9,437,184 FLOP/chunk/head（每 MAC 按 2 FLOP）
 ```
 
-还没有计入 exp2、乘法、mask、copy、dtype conversion、synchronization 和尾块 predicate。
+还没有计入 exp2、reciprocal、乘法、mask、copy、dtype conversion、synchronization 和尾块 predicate。
+对一个完整 chunk/head，按源码循环的逻辑 element 数计，gamma 优化前后为：
 
-## 13. 当前 profile 揭示的真正执行状态
+| gate 操作位置 | 优化前 | 优化后 |
+| --- | ---: | ---: |
+| residual `gamma_i` | 8,192 次 `exp2` | 8,192 次 shared read/multiply |
+| output state contribution `gamma_i` | 8,192 次 `exp2` | 8,192 次 shared read/multiply |
+| lower-triangular score ratio | 2,080 次 `exp2` | 2,080 次 `gamma*inv_gamma` |
+| state tile `gamma_last` | 16,384 次 `exp2` | 16,384 次 shared scalar multiply |
+| Z decay ratio | 8,192 次 `exp2` | 8,192 次 `gamma_last*inv_gamma` |
+| chunk 准备 | 0 | 64 次 `exp2` + 64 次 reciprocal |
+
+即源码层面把完整 chunk 的最多 43,040 次重复 `exp2` 表达式收敛为 64 次 `exp2` 和 64 次 reciprocal。
+编译器可能对旧表达式做部分 CSE/hoist，所以这不是 SASS 指令数；实际收益必须以 benchmark/profile 为准。
+
+## 13. 优化前 profile 揭示的执行状态
 
 以 `long_low_gva: B=1, T=32768, Hq=2, Hv=8` 为例：
 
@@ -481,7 +512,7 @@ MIG SMs = 14
 
 - 只有 8 个 SM 能拿到 block，另外 6 个 SM 从头到尾空闲。
 - 每个 block 串行做 512 个 chunks，每 chunk 六次 GEMM。
-- 200 registers/thread 和约 113.5 KiB shared memory 都限制为 1 block/SM。
+- 优化前的 200 registers/thread 和约 113.5 KiB shared memory 都限制为 1 block/SM。
 - achieved occupancy 为 12.51%，waves/SM 为 0.57。
 - kernel 约 3.845 ms；DRAM 约 52.5 GB/s，只达到实例 peak 的约 20.6%。
 - memory-pipeline utilization 高于 compute，但两者都远未饱和；根因首先是 grid 太小和长 state chain。
@@ -489,21 +520,70 @@ MIG SMs = 14
 因此“再减少一点 global load”或“把 occupancy 数字提高”不一定直接解决 low-head case。要让 14 个 SM
 都工作，需要改变 state owner 的 block 分解，或得到能跨 chunk/子块并行组合的数学形式。
 
-## 14. 从当前代码出发的优化检查表
+## 14. 优化 1：预计算 gamma、1/gamma 与 gamma_last
 
-1. `g_last` 的 `exp2` 是否被提升到循环外并在整个 state tile 复用？
-2. `exp(g_i)` 和各种 gate ratio 是否可以每 token/score 预计算，减少 SFU 指令？
-3. 下一 chunk 的 global-to-shared load 能否用 `T.Pipelined`/async copy/TMA 与当前 GEMM 重叠？
-4. ping-pong buffer 增加的 shared memory 是否仍允许目标 occupancy？
-5. `q/k/v/a/z/score/state` 的 shared layout 是否存在 bank conflict 或 Tensor Core operand replay？
-6. TileLang 对六次 `T.gemm` 各自生成了 `mma` 还是 `wgmma`，shape 是否充分利用 N>=64 的 Hopper
+### 14.1 实现与同步边界
+
+每个 chunk 的 gate 装载循环现在完成三件事：从 global FP32 `g/beta` 读取有效 token，计算并写入
+`gamma_shared`，再计算 `inv_gamma_shared`。这一步结束后，后续五处 gate 使用都变成 shared load
+加普通乘法。完整 chunk 的 `gamma_last` 在该并行循环结束后由所有线程统一执行的控制流读取 row 63；
+尾块则对全局最后一个 `g` 提前做一次 `exp2`。
+
+曾尝试让最后一个有效 token 在 `T.Parallel` 的条件分支内直接写 `gamma_last`。该版本能编译但首个
+kernel launch 不返回，说明当前 TileLang lowering 在这类分歧 shared-memory 路径上存在同步风险。
+最终版本把标量写入放回并行循环之后的统一控制流，避免让部分线程绕过潜在的 block barrier。
+
+这项优化没有改变 launch grid、block threads、六次 GEMM、fragment shape 或 global output 分配；只把
+`g_shared[64]` 替换为 `gamma_shared[64] + inv_gamma_shared[64]`，shared memory 逻辑用量增加 256 B。
+
+### 14.2 测试方法
+
+- 设备：`NVIDIA H800 PCIe MIG 1g.10gb`，lab3 分区，1 GPU、8 CPU、32 GiB host memory。
+- 命令：`./job.sh --output-format csv`，即每个 case 10 次 warmup、100 次重复并取 CUDA event 中位数。
+- 计时范围：仅学生函数内部核心 forward，包含输出分配和一次 recurrent kernel launch，不含 g/A 预处理。
+- 基线日志：`output/gamma_precompute_baseline_56516.log`。
+- 最终日志：`output/gamma_precompute_final_56568.log`。
+- 正确性：8 个 case 的 BF16 output 和 FP32 final state 均为 `PASS`。
+
+### 14.3 时间、speedup 与预计分数
+
+| case | baseline (ms) | optimized (ms) | speedup | `p=t100/t` | 预计分数 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `short_tail_state` | 0.147712 | 0.144288 | 1.0237x | 2.3983 | 120.00 |
+| `chain_equal` | 0.947344 | 0.922480 | 1.0270x | 0.5396 | 78.97 |
+| `parallel_equal` | 0.563232 | 0.545008 | 1.0334x | 0.9381 | 96.68 |
+| `parallel_gva` | 0.504080 | 0.495856 | 1.0166x | 0.9913 | 99.53 |
+| `long_low_gva` | 3.766192 | 3.676608 | 1.0244x | 0.5056 | 77.59 |
+| `batch_split_gva` | 2.913376 | 2.829680 | 1.0296x | 0.5414 | 78.79 |
+| `wide_gva_state` | 5.264464 | 5.085760 | 1.0351x | 0.4771 | 76.29 |
+| `deep_gva_state` | 5.970896 | 5.777808 | 1.0334x | 0.4900 | 76.70 |
+
+公开 8 case 的预计简单平均为 **88.07 分**。实验文档只公布 60/100 分 turning point，没有给出完整
+插值函数，因此这里明确采用以下估算曲线：
+
+```text
+p <= p60:       score = 60 * p / p60
+p60 < p <= 1:   score = 60 + 40 * (p-p60) / (1-p60)
+p > 1:          score = min(120, 100 + 20 * (p-1))
+```
+
+这只是公开 case 估计，不包含占最终分数 40% 的隐藏 case。8 个 case 均有 1.0166x--1.0351x 提升；
+收益不如源码层面的 `exp2` 数量降幅大，说明六次 Tensor Core GEMM、shared/register movement 以及
+编译器原有的部分公共子表达式处理仍占主要时间。
+
+## 15. 从当前代码出发的优化检查表
+
+1. 下一 chunk 的 global-to-shared load 能否用 `T.Pipelined`/async copy/TMA 与当前 GEMM 重叠？
+2. ping-pong buffer 增加的 shared memory 是否仍允许目标 occupancy？
+3. `q/k/v/a/z/score/state` 的 shared layout 是否存在 bank conflict 或 Tensor Core operand replay？
+4. TileLang 对六次 `T.gemm` 各自生成了 `mma` 还是 `wgmma`，shape 是否充分利用 N>=64 的 Hopper
    Tensor Core throughput？
-7. `state FP32 fragment -> BF16 shared` 每 chunk 的 conversion/copy 能否减少或与其他操作重叠？
-8. GVA 中同一个 Q/K head 被多个 value heads 重复加载，能否利用 L2、cluster DSM 或调整 block ownership？
-9. 对 `B*Hv < 14` 的 case，能否把一个 state 的 dv/dk tile 拆给多个 cooperating blocks？同步和 reduction
+5. `state FP32 fragment -> BF16 shared` 每 chunk 的 conversion/copy 能否减少或与其他操作重叠？
+6. GVA 中同一个 Q/K head 被多个 value heads 重复加载，能否利用 L2、cluster DSM 或调整 block ownership？
+7. 对 `B*Hv < 14` 的 case，能否把一个 state 的 dv/dk tile 拆给多个 cooperating blocks？同步和 reduction
    成本是否小于多用 SM 的收益？
-10. 对 `B*Hv >= 14` 的 case，降低 registers/shared 以允许更多 blocks/SM 是否真正改善 stall reason？
+8. 对 `B*Hv >= 14` 的 case，降低 registers/shared 以允许更多 blocks/SM 是否真正改善 stall reason？
 
-这十项分别对应 SFU、pipeline、shared-memory capacity/layout、Tensor Core、GVA reuse 和 grid-level
-parallelism。后续每次改动都应先明确它针对哪一项，再用相同 case 的 NCU/NSYS 数据验证。
+这些项目分别对应 pipeline、shared-memory capacity/layout、Tensor Core、GVA reuse 和 grid-level
+parallelism。后续每次改动都应先明确它针对哪一项，再用相同 case 的 benchmark 与 NCU/NSYS 数据验证。
 

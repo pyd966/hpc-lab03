@@ -69,9 +69,10 @@ def tilelang_residual_first(
             score_shared = T.alloc_shared(
                 (CHUNK_SIZE, CHUNK_SIZE), dtype=qk_dtype
             )
-            g_shared = T.alloc_shared((CHUNK_SIZE,), dtype=gate_dtype)
+            gamma_shared = T.alloc_shared((CHUNK_SIZE,), dtype=gate_dtype)
+            inv_gamma_shared = T.alloc_shared((CHUNK_SIZE,), dtype=gate_dtype)
             beta_shared = T.alloc_shared((CHUNK_SIZE,), dtype=gate_dtype)
-            g_last = T.alloc_shared((1,), dtype=gate_dtype)
+            gamma_last = T.alloc_shared((1,), dtype=gate_dtype)
 
             state = T.alloc_fragment(
                 (HEAD_DIM_K, HEAD_DIM_V), dtype=accum_dtype
@@ -108,15 +109,21 @@ def tilelang_residual_first(
                         a_shared[row, col] = 0
                 for token in T.Parallel(CHUNK_SIZE):
                     if left + token < num_tokens:
-                        g_shared[token] = g[bb, left + token, bh]
+                        gamma_shared[token] = T.exp2(
+                            g[bb, left + token, bh] * LOG2E
+                        )
+                        inv_gamma_shared[token] = 1.0 / gamma_shared[token]
                         beta_shared[token] = beta[bb, left + token, bh]
                     else:
-                        g_shared[token] = 0
+                        gamma_shared[token] = 1.0
+                        inv_gamma_shared[token] = 1.0
                         beta_shared[token] = 0
                 if right <= num_tokens:
-                    g_last[0] = g_shared[CHUNK_SIZE - 1]
+                    gamma_last[0] = gamma_shared[CHUNK_SIZE - 1]
                 else:
-                    g_last[0] = g[bb, num_tokens - 1, bh]
+                    gamma_last[0] = T.exp2(
+                        g[bb, num_tokens - 1, bh] * LOG2E
+                    )
 
                 # Residual-first form:
                 #   R = beta * (V - exp(g) * K @ S)
@@ -126,7 +133,7 @@ def tilelang_residual_first(
                     if left + token < num_tokens:
                         z[token, dim] = beta_shared[token] * (
                             v_shared[token, dim]
-                            - T.exp2(g_shared[token] * LOG2E) * z[token, dim]
+                            - gamma_shared[token] * z[token, dim]
                         )
                     else:
                         z[token, dim] = 0
@@ -137,9 +144,7 @@ def tilelang_residual_first(
                 # Contribution from the state at the start of the chunk.
                 T.gemm(q_shared, state_shared, out, clear_accum=True)
                 for token, dim in T.Parallel(CHUNK_SIZE, HEAD_DIM_V):
-                    out[token, dim] *= SCALE * T.exp2(
-                        g_shared[token] * LOG2E
-                    )
+                    out[token, dim] *= SCALE * gamma_shared[token]
 
                 # Causal in-chunk contribution: tril(Q K^T * decay) @ Z.
                 T.gemm(
@@ -151,8 +156,10 @@ def tilelang_residual_first(
                 )
                 for row, col in T.Parallel(CHUNK_SIZE, CHUNK_SIZE):
                     if row >= col and left + row < num_tokens:
-                        score[row, col] *= SCALE * T.exp2(
-                            (g_shared[row] - g_shared[col]) * LOG2E
+                        score[row, col] *= (
+                            SCALE
+                            * gamma_shared[row]
+                            * inv_gamma_shared[col]
                         )
                     else:
                         score[row, col] = 0
@@ -163,12 +170,12 @@ def tilelang_residual_first(
                     if left + token < num_tokens:
                         output[bb, left + token, bh, dim] = out[token, dim]
 
-                # S' = exp(g_last) S + K^T @ (exp(g_last-g_i) Z_i).
+                # S' = gamma_last * S + K^T @ ((gamma_last / gamma_i) * Z_i).
                 for dim_k, dim_v in T.Parallel(HEAD_DIM_K, HEAD_DIM_V):
-                    state[dim_k, dim_v] *= T.exp2(g_last[0] * LOG2E)
+                    state[dim_k, dim_v] *= gamma_last[0]
                 for token, dim in T.Parallel(CHUNK_SIZE, HEAD_DIM_V):
-                    z[token, dim] *= T.exp2(
-                        (g_last[0] - g_shared[token]) * LOG2E
+                    z[token, dim] *= (
+                        gamma_last[0] * inv_gamma_shared[token]
                     )
                 T.copy(z, z_shared)
                 T.gemm(
