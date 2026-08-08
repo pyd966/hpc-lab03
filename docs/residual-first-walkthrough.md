@@ -4,6 +4,9 @@
 实现。目标是同时回答三件事：它在数学上算什么、为什么与实验文档公式等价、每一步最终如何映射到
 当前 GPU kernel。
 
+本文对应提交 `57a2ace`。特别地，当前版本已经实现 gate 指数缓存和两阶段输入预取；文中会明确区分
+源码里的逻辑 buffer、`T.Pipelined` lowering 后的物理 ping-pong buffer，以及 FP32 register state。
+
 ## 1. 问题、形状与符号
 
 实验固定：
@@ -167,8 +170,8 @@ residual-first MAC/chunk/head
 saving = C^2*dk = 524,288 MAC = 10%
 ```
 
-profile 中只比较 recurrent kernel，document 为 4.234 ms，residual 为 3.845 ms，约 9.2% 时间减少，
-与 10% MAC reduction 接近。总速度提升更大，是因为 residual 还融合掉了整个 W/U prepare kernel 和
+在加入本轮 gate 缓存和 pipeline 之前，只比较 recurrent kernel 时，document 为 4.234 ms、residual
+为 3.845 ms，约减少 9.2%，与 10% MAC reduction 接近。总速度提升更大，因为 residual 还融合了 W/U prepare kernel 和
 W/U 的 global-memory round trip。
 
 ## 6. 输出公式
@@ -223,7 +226,9 @@ S_next = gamma_last * S + K^T @ Z_end
          + sum_i k_i^T @ (gamma_last/gamma_i * Z_i)
 ```
 
-`S_next` 成为下一 chunk 的 `S`。这条依赖就是当前 kernel 必须 `T.serial(chunks_per_batch)` 的原因。
+`S_next` 成为下一 chunk 的 `S`。这条依赖要求 recurrent compute 按 chunk 顺序提交。当前源码使用
+`T.Pipelined`，但只有不依赖 state 的下一 chunk 输入 load 进入前一 stage；六次 GEMM 和 state update
+仍全部位于同一个依赖 stage，语义上依然是串行 state chain。
 
 ## 8. Python wrapper 和 launch mapping
 
@@ -241,7 +246,19 @@ output      [B,T,Hv,128] BF16
 final_state [B,Hv,128,128] FP32
 ```
 
-然后专门化 JIT kernel 的 `H=Hv`、`Hg=Hq`、dtype 和是否存在 initial state。动态维度只有 B/T。
+然后专门化 JIT kernel 的 `H=Hv`、`Hg=Hq`、dtype、是否存在 initial state，以及两个分类参数：
+
+```text
+low_parallel = (B * Hv < 14)
+gva_variant  = (Hv != Hq)
+```
+
+`low_parallel` 在 wrapper 中选择 `tilelang_residual_first_low_parallel` 或
+`tilelang_residual_first_normal`；`gva_variant` 区分 GVA/MHA kernel 名。当前 checkpoint 中四个名字最终仍
+进入同一个 kernel body，尚未改变 grid、tile 或算法。这是为后续真正分流保留的 specialization 边界，
+不能把“生成了不同 kernel 名”误解为“已经执行不同优化”。
+
+动态维度只有 B/T。`H/Hg`、dtype 和 `use_initial_state` 都会触发独立 JIT specialization。
 
 实际 launch 是：
 
@@ -270,39 +287,65 @@ chunk 串行走到最后一个 chunk。TileLang 把 block 内的 `T.Parallel` �
 
 ## 9. Shared memory 与 fragment
 
-每个 block 分配：
+每个 block 在源码中声明的逻辑 shared allocations 如下：
 
-| buffer | shape/dtype | 逻辑大小 | 用途 |
-| --- | --- | ---: | --- |
-| `q_shared` | `[64,128]` BF16 | 16 KiB | Q Tensor Core operand |
-| `k_shared` | `[64,128]` BF16 | 16 KiB | K Tensor Core operand |
-| `v_shared` | `[64,128]` BF16 | 16 KiB | V |
-| `a_shared` | `[64,64]` BF16 | 8 KiB | triangular inverse A |
-| `z_shared` | `[64,128]` BF16 | 16 KiB | R/Z/decayed-Z Tensor Core operand |
-| `state_shared` | `[128,128]` BF16 | 32 KiB | state 的 Tensor Core operand copy |
-| `score_shared` | `[64,64]` BF16 | 8 KiB | causal QK score |
-| `g_shared` | `[64]` FP32 | 256 B | log gamma |
-| `beta_shared` | `[64]` FP32 | 256 B | beta |
-| `g_last` | `[1]` FP32 | 4 B | chunk 最后有效 gate |
+| buffer | shape/dtype | 单 stage 大小 | 是否被 pipeline 双缓冲 | 用途 |
+| --- | --- | ---: | --- | --- |
+| `q_shared` | `[64,128]` BF16 | 16 KiB | 是 | Q Tensor Core operand |
+| `k_shared` | `[64,128]` BF16 | 16 KiB | 是 | K Tensor Core operand |
+| `v_shared` | `[64,128]` BF16 | 16 KiB | 是 | V |
+| `a_shared` | `[64,64]` BF16 | 8 KiB | 是 | triangular inverse A |
+| `g_shared` | `[64]` FP32 | 256 B | 是 | log gamma |
+| `beta_shared` | `[64]` FP32 | 256 B | 是 | beta |
+| `z_shared` | `[64,128]` BF16 | 16 KiB | 否 | R/Z/decayed-Z operand |
+| `state_shared` | `[128,128]` BF16 | 32 KiB | 否 | 当前 state 的 GEMM operand |
+| `score_shared` | `[64,64]` BF16 | 8 KiB | 否 | causal QK score |
+| `g_exp_shared` | `[64]` FP32 | 256 B | 否 | `gamma_i=exp(g_i)` |
+| `g_inv_exp_shared` | `[64]` FP32 | 256 B | 否 | `1/gamma_i` |
+| `g_last_exp` | `[1]` FP32 | 4 B | 否 | 最后一个有效 token 的 gamma |
 
-逻辑合计约 112.5 KiB；对齐和 driver reservation 后 NCU 报告 116,240 B/block。
+如果只把源码中的每个数组算一次，逻辑合计为：
+
+```text
+Q/K/V             48 KiB
+A/Z/state/score   64 KiB
+四个 FP32 vector   1 KiB
+g_last_exp         4 B
+------------------------
+base              113.004 KiB
+```
+
+`T.Pipelined` 把 stage-0 producer 的 Q/K/V/A/g/beta 变成两套物理 buffer，额外增加：
+
+```text
+16 + 16 + 16 + 8 + 0.25 + 0.25 = 56.5 KiB
+```
+
+因此 lowering 后的理论 payload 约为 `169.504 KiB = 173,572 B`。NCU 的 `Kbyte` 使用十进制单位，
+实测 dynamic shared memory 是 `173.584 kB = 173,584 B = 169.516 KiB/block`，另有
+`1.024 kB = 1 KiB/block` driver shared memory。12 B 差额来自 alignment/compiler bookkeeping。
+169.516 KiB 已经使 shared-memory block limit 等于 1。
 
 fragment 是分布式 register tile：
 
 ```text
-state [128,128] FP32
-z     [64,128]  FP32
-out   [64,128]  FP32
-score [64,64]   FP32
+state [128,128] FP32 = 16,384 registers = 64 registers/thread
+z     [64,128]  FP32 =  8,192 registers = 32 registers/thread
+out   [64,128]  FP32 =  8,192 registers = 32 registers/thread
+score [64,64]   FP32 =  4,096 registers = 16 registers/thread
+---------------------------------------------------------------
+纯 payload                         = 144 registers/thread
 ```
 
-这些矩阵不会在每个线程里各复制一份。TileLang 根据 GEMM layout 把 fragment element 分布到 warps 和
-threads。最终 NCU 实测为 200 registers/thread，即 51,200 registers/block。register 和 shared
-memory 都把 residency 限制为 1 block/SM。
+这些矩阵不会在每个线程里各复制一份。TileLang 根据 GEMM layout 把 fragment elements 分布给 256 个
+threads；地址、索引、predicate、pipeline state 和临时 operand 还需要额外 registers。当前 NCU 实测
+为 `197 registers/thread`，即至少 `50,432` 个 32-bit registers/block，没有 local/shared spill。
+register limit 和 shared-memory limit 都只允许 1 block/SM。
 
-state fragment 一直跨 chunk 保持 FP32；每个 chunk 开头复制为 BF16 `state_shared` 供 Tensor Core
-读取。GEMM accumulation 使用 FP32。Z 在 element-wise/GEMM accumulator 中是 FP32，但复制到
-`z_shared` 时转换为 BF16。这些 dtype 边界是当前实现的数值语义和误差来源之一。
+state fragment 在整个 chunk chain 中保持 FP32；每个 chunk 开头才转换为 BF16 `state_shared`，供
+Tensor Core 作为 input operand。所有 `T.gemm` accumulator 是 FP32。R/Z 和 score 在 fragment
+中是 FP32，但写入 `z_shared`/`score_shared` 时变为 BF16，然后被下一个 GEMM 读取。这些转换点既
+降低 shared-memory 容量，也是当前算法相对纯 FP32 reference 的主要舍入边界。
 
 ## 10. 一个 chunk 的实际执行顺序
 
@@ -315,16 +358,47 @@ state fragment 一直跨 chunk 保持 FP32；每个 chunk 开头复制为 BF16 `
 无 initial_state: clear state fragment to zero
 ```
 
-每个 chunk 开头：
+每个 pipeline iteration 分成两类操作：
 
 ```text
-state fragment FP32 -> state_shared BF16
-global Q/K/V/A BF16  -> corresponding shared buffers
-global g/beta FP32   -> shared vectors
+stage 0（与 state 无关，可预取）
+    global Q/K/V/A/g/beta -> ping-pong shared buffer
+
+stage 1（依赖当前 S，严格按 chunk 顺序）
+    state FP32 fragment -> state_shared BF16
+    gate exponent preprocessing
+    六次 GEMM、element-wise、output store、state update
 ```
 
-当前实现使用 `T.copy` 和 `T.Parallel`，没有显式 async copy 或 double buffer。尾块将无效 Q/K/V/A
-row 填零，g/beta 也填零。`g_last` 取最后一个有效 token，而不是固定取 row 63。
+源码只声明一份 `q_shared` 等名字，但 `T.Pipelined` 根据 stage annotation 为 stage-0 producers
+生成两套物理 storage。稳态下，在 stage 1 消费 chunk `c` 的一套 buffer 时，另一套可以准备
+chunk `c+1`。pipeline prologue 先装入第一个 chunk，epilogue 则排空最后一个 chunk。
+
+state 不能进入 stage 0，因为 `state_shared(c)` 必须来自 `S_c`，而 `S_c` 直到 chunk `c-1`
+的最后一次 `K^T@Z` 完成后才存在。于是当前 ping-pong 隐藏的是 global-to-shared input latency，
+不是 chunk recurrence。
+
+输入可用后，每个 token 只做一次指数并缓存：
+
+```text
+gamma_i     = exp2(g_i * log2(e))
+inv_gamma_i = 1 / gamma_i
+gamma_last  = gamma_63                    # 完整 chunk
+gamma_last  = exp(g_[last valid token])   # tail chunk
+```
+
+后面的三类比例都改为乘缓存值：
+
+```text
+exp(g_i)              -> gamma_i
+exp(g_row-g_col)      -> gamma_row * inv_gamma_col
+exp(g_last-g_i)       -> gamma_last * inv_gamma_i
+```
+
+因此每个完整 chunk/head 只有 64 次 `exp2` 和 64 次 reciprocal，不再为每个 output element、
+score element 或 state element 重复调用指数函数。尾块仍使用固定 64-row tile；越界 load 由 copy
+lowering 做 predicate/zero-fill，residual 和 output store 还显式检查 `left+token<num_tokens`。
+`gamma_last` 始终来自最后一个有效 token，不会错误地读取 row 63。
 
 ### 10.2 GEMM 1：用 K 从旧 state 读取预测
 
@@ -344,7 +418,7 @@ T.gemm(k_shared, state_shared, z, clear_accum=True)
 ### 10.3 Element-wise：形成 raw residual R
 
 ```text
-z_i = beta_i * (v_i - exp(g_i) * z_i)
+z_i = beta_i * (v_i - gamma_i * z_i)
 ```
 
 现在 z fragment 被原地改写为 R。随后复制到 BF16 `z_shared`，作为下一次 Tensor Core GEMM operand。
@@ -363,7 +437,7 @@ z = A @ R
 ```text
 out = Q @ S
 [64,128] x [128,128] -> [64,128]
-out_i *= scale * exp(g_i)
+out_i *= scale * gamma_i
 ```
 
 `out` 是 FP32 accumulator，此时只包含 chunk 入口 state 的贡献。
@@ -379,7 +453,7 @@ score = Q @ K^T
 
 ```text
 if row >= col:
-    score[row,col] *= scale * exp(g[row]-g[col])
+    score[row,col] *= scale * gamma_row * inv_gamma_col
 else:
     score[row,col] = 0
 ```
@@ -399,16 +473,17 @@ out += score @ Z
 ### 10.8 Element-wise：把旧 state 衰减到 chunk 末尾
 
 ```text
-state *= exp(g_last)
+state *= gamma_last
 ```
 
-state fragment 仍为 FP32。代码当前在 `[128,128]` 的 `T.Parallel` 循环表达这个操作；应检查生成代码
-是否将相同的 `exp(g_last)` 提升复用，否则会产生大量重复 SFU 工作。
+state fragment 仍为 FP32。`gamma_last` 已经在 shared 中缓存为一个 FP32 scalar；`[128,128]` 的
+`T.Parallel` 循环只执行乘法，不再对每个 state element 调用 `exp2`。这一步更新的是长期保存的 FP32
+state，而不是前面用于 GEMM input 的 BF16 `state_shared` 副本。
 
 ### 10.9 Element-wise：把 Z 衰减到 chunk 末尾
 
 ```text
-z_i *= exp(g_last - g_i)
+z_i *= gamma_last * inv_gamma_i
 ```
 
 然后将 decayed Z 转为 BF16 `z_shared`。
@@ -421,7 +496,8 @@ state += K^T @ z
 ```
 
 这里同样使用 `clear_accum=False`，把 rank-64 chunk update 累加到已经衰减的 FP32 state fragment。
-随后进入下一个 `T.serial` chunk。所有 chunk 完成后才把 state 写到 global FP32 `final_state`。
+随后 pipeline 才能让下一个 chunk 的 recurrent stage 消费这个新 state。所有 chunks 完成后，kernel
+只执行一次 `state -> final_state` 的 global FP32 store。
 
 ## 11. 为什么 chunks 串行、chunk 内并行
 
@@ -431,17 +507,29 @@ state += K^T @ z
 S_(c+1) depends on S_c
 ```
 
-因此当前一个 block 内的 chunk loop 不能简单换成 `T.Parallel` 或 `T.Pipelined` 后同时计算多个完整
-chunk。尤其 GEMM 1 (`K@S`) 和 GEMM 3 (`Q@S`) 必须等当前 `S` 可用。
+因此不能把依赖 state 的 recurrent statements 放到同一个 pipeline 的不同前置 stage，让多个完整
+chunks 同时执行。尤其 GEMM 1 (`K@S`) 和 GEMM 3 (`Q@S`) 必须读取同一个刚刚完成的 `S_c`，
+GEMM 6 又必须成为下一 iteration 的 producer。
 
-可以提前并行/流水的是：
+当前 `T.Pipelined` 合法，是因为它只移动以下与 `S_c` 无关的 producer：
 
 ```text
 load Q_(c+1), K_(c+1), V_(c+1), A_(c+1), g_(c+1), beta_(c+1)
 ```
 
-这些输入不依赖 `S_c`。所以合理的 pipeline 是“当前 chunk 计算 + 下一 chunk 数据搬运”，而不是让
-多个 chunk 同时更新同一个 state。
+稳态时间线是：
+
+```text
+time ---->
+
+shared set 0:  load chunk 0 | compute chunk 0 | load chunk 2 | compute chunk 2
+shared set 1:               | load chunk 1    | compute chunk 1 | load chunk 3
+state chain:      S0 -------> S1 -------------> S2 -------------> S3
+```
+
+这里的图只表达 storage ping-pong；`compute chunk 0/1/2` 仍然按 state arrows 串行。实现没有创建第二
+份 state，也没有做跨 chunk prefix scan。换句话说，当前 pipeline 重叠“输入搬运”和“已有 state 上的
+计算”，没有重叠两个 state transitions。
 
 ## 12. 精确的计算量
 
@@ -464,7 +552,23 @@ load Q_(c+1), K_(c+1), V_(c+1), A_(c+1), g_(c+1), beta_(c+1)
 = 9,437,184 FLOP/chunk/head（每 MAC 按 2 FLOP）
 ```
 
-还没有计入 exp2、乘法、mask、copy、dtype conversion、synchronization 和尾块 predicate。
+GEMM 之外，每个完整 chunk/head 还包含：
+
+| 操作 | logical elements |
+| --- | ---: |
+| `gamma=exp(g)` | 64 exp2 |
+| `inv_gamma=1/gamma` | 64 reciprocal |
+| residual formation | `C*dv = 8,192` |
+| old-state output scaling | `C*dv = 8,192` |
+| score gate/mask | `C^2 = 4,096` |
+| FP32 state decay | `dk*dv = 16,384` |
+| Z-to-chunk-end decay | `C*dv = 8,192` |
+| output store | `C*dv = 8,192` |
+
+还要加上 global/shared copies、FP32-to-BF16 conversion、six-GEMM synchronization、pipeline control 和
+尾块 predicates。这里的 logical element 数不等于机器指令数：`T.Parallel` 会把 iteration domain
+分给 256 threads，`T.gemm` 则会进一步 lower 成 warp-group Tensor Core instructions。当前每个
+chunk/head 的主算法工作量仍是 4,718,592 MAC；gate 缓存改变的是额外 SFU 工作，不改变这些 MAC。
 
 ## 13. 当前 profile 揭示的真正执行状态
 
@@ -477,33 +581,151 @@ block = 256 threads = 8 warps
 MIG SMs = 14
 ```
 
-结果：
+对应提交 `57a2ace` 的 NCU 数据：
 
-- 只有 8 个 SM 能拿到 block，另外 6 个 SM 从头到尾空闲。
-- 每个 block 串行做 512 个 chunks，每 chunk 六次 GEMM。
-- 200 registers/thread 和约 113.5 KiB shared memory 都限制为 1 block/SM。
-- achieved occupancy 为 12.51%，waves/SM 为 0.57。
-- kernel 约 3.845 ms；DRAM 约 52.5 GB/s，只达到实例 peak 的约 20.6%。
-- memory-pipeline utilization 高于 compute，但两者都远未饱和；根因首先是 grid 太小和长 state chain。
+| 指标 | 当前值 | 直接含义 |
+| --- | ---: | --- |
+| grid | 8 blocks | 最多只使用 8/14 个 SM |
+| block | 256 threads = 8 warps | 每个 active SM 只有 8 resident warps |
+| registers/thread | 197 | `50,432 registers/block`，register block limit=1 |
+| dynamic shared/block | 173,584 B = 169.52 KiB | shared-memory block limit=1 |
+| achieved occupancy | 12.50% | 8/64 warps |
+| waves/SM | 0.57 | 整个 grid 小于 SM 数 |
+| No Eligible | 76.71% | scheduler 经常找不到可发射 warp |
+| SM throughput | 13.35% | 计算管线没有接近饱和 |
+| DRAM throughput | 22.83% | 也不是 HBM bandwidth bound |
+| L1/TEX throughput | 58.19% | active blocks 内 shared/L1 activity 较显著 |
+| local/shared spill | 0 B | 高 register 数尚未造成 spill |
+| profiled duration | 3.52 ms | NCU instrumentation 下的单次 duration |
+| stable benchmark | 3.42--3.45 ms | 非 profile 的 median 范围 |
 
-因此“再减少一点 global load”或“把 occupancy 数字提高”不一定直接解决 low-head case。要让 14 个 SM
-都工作，需要改变 state owner 的 block 分解，或得到能跨 chunk/子块并行组合的数学形式。
+因此当前低并行 case 的第一问题不是 HBM peak，也不是单纯把 occupancy 数字从 12.5% 改到 25%。
+`512 threads/block` 实验虽然把 active warps 翻倍并降低 long-scoreboard stall，却让 TileLang 生成
+53.5% 更多 instructions；grid 仍是 8，六个 SM 仍空闲，最后反而慢约 8%。要获得新的 Tensor Core
+资源，必须增加独立 blocks，或者使用能并行组合 chunk transitions 的数学形式。
 
-## 14. 从当前代码出发的优化检查表
+## 14. End-to-end 伪代码
 
-1. `g_last` 的 `exp2` 是否被提升到循环外并在整个 state tile 复用？
-2. `exp(g_i)` 和各种 gate ratio 是否可以每 token/score 预计算，减少 SFU 指令？
-3. 下一 chunk 的 global-to-shared load 能否用 `T.Pipelined`/async copy/TMA 与当前 GEMM 重叠？
-4. ping-pong buffer 增加的 shared memory 是否仍允许目标 occupancy？
-5. `q/k/v/a/z/score/state` 的 shared layout 是否存在 bank conflict 或 Tensor Core operand replay？
-6. TileLang 对六次 `T.gemm` 各自生成了 `mma` 还是 `wgmma`，shape 是否充分利用 N>=64 的 Hopper
-   Tensor Core throughput？
-7. `state FP32 fragment -> BF16 shared` 每 chunk 的 conversion/copy 能否减少或与其他操作重叠？
-8. GVA 中同一个 Q/K head 被多个 value heads 重复加载，能否利用 L2、cluster DSM 或调整 block ownership？
-9. 对 `B*Hv < 14` 的 case，能否把一个 state 的 dv/dk tile 拆给多个 cooperating blocks？同步和 reduction
-   成本是否小于多用 SM 的收益？
-10. 对 `B*Hv >= 14` 的 case，降低 registers/shared 以允许更多 blocks/SM 是否真正改善 stall reason？
+下面把 wrapper、block ownership、pipeline 和一个 chunk 内的所有数据变换压缩到同一份伪代码中。
+所有矩阵表达式都针对一个 `(batch, value_head)`：
 
-这十项分别对应 SFU、pipeline、shared-memory capacity/layout、Tensor Core、GVA reuse 和 grid-level
-parallelism。后续每次改动都应先明确它针对哪一项，再用相同 case 的 NCU/NSYS 数据验证。
+```text
+function gdn_prefill_forward(Q, K, V, g, beta, A, initial_state):
+    B, T, Hq, dk = shape(Q)
+    Hv, dv = V.heads, V.value_dim
+    n_chunks = ceil(T / 64)
+
+    allocate output[B,T,Hv,dv] BF16
+    allocate final_state[B,Hv,dk,dv] FP32
+
+    select kernel name from:
+        low_parallel = (B*Hv < 14)
+        gva_variant  = (Hv != Hq)
+    # 当前四种名字的 body 相同
+
+    launch grid=B*Hv blocks, 256 threads/block
+
+kernel(block):
+    bb  = block // Hv
+    bh  = block % Hv
+    bhg = bh // (Hv/Hq)
+
+    if initial_state exists:
+        state[dk,dv] FP32 fragment = initial_state[bb,bh]
+    else:
+        state = 0
+
+    pipeline over chunk c:
+        stage 0:
+            prefetch Q[c,bb,bhg], K[c,bb,bhg]
+            prefetch V[c,bb,bh], A[c,bb,bh]
+            prefetch g[c,bb,bh], beta[c,bb,bh]
+            use the alternate shared-memory buffer set
+
+        stage 1:
+            state_shared BF16 = cast(state FP32)
+
+            gamma[i]     = exp2(g[i] * log2(e))
+            inv_gamma[i] = 1 / gamma[i]
+            gamma_last   = gamma[last_valid]
+
+            # GEMM 1: prediction from entry state
+            P = K @ state_shared
+
+            # FP32 residual, invalid tail rows become zero
+            R[i,:] = beta[i] * (V[i,:] - gamma[i] * P[i,:])
+
+            # BF16 boundary, then GEMM 2
+            Z = A @ cast_bf16(R)
+
+            # GEMM 3: output contribution from entry state
+            O = Q @ state_shared
+            O[i,:] *= scale * gamma[i]
+
+            # GEMM 4 and causal/gate epilogue
+            score = Q @ K^T
+            score[i,j] =
+                scale * score[i,j] * gamma[i] * inv_gamma[j], if j <= i
+                0,                                              otherwise
+
+            # BF16 boundaries, then GEMM 5
+            O += cast_bf16(score) @ cast_bf16(Z)
+
+            if token i is valid:
+                output[bb, token_i, bh, :] = cast_bf16(O[i,:])
+
+            # State transition to chunk end
+            state[:,:] *= gamma_last
+            Z_end[i,:] = Z[i,:] * gamma_last * inv_gamma[i]
+
+            # BF16 boundary, then GEMM 6 with FP32 accumulation
+            state += K^T @ cast_bf16(Z_end)
+
+    final_state[bb,bh,:,:] = state FP32
+    return
+```
+
+这份伪代码中，`P/R/Z/O/score/Z_end` 是逻辑名字；实际代码复用 `z` fragment 依次承载
+`P -> R -> Z -> Z_end`，复用 `out` 作为两个 output GEMM 的 FP32 accumulator。这样避免了额外
+global intermediates，但也形成了必须遵守的 overwrite 顺序。
+
+## 15. 数据所有权、同步和正确性不变量
+
+当前 kernel 的关键不变量如下：
+
+1. 一个 block 在整个 kernel lifetime 内唯一拥有一个完整 `S[128,128]`；其他 block 不读写它。
+2. chunks 按时间顺序更新同一份 FP32 state；只有输入 shared buffers 可以跨 iteration ping-pong。
+3. `state_shared` 是当前 FP32 state 的 BF16 snapshot。它同时服务 `K@S` 和 `Q@S`，但之后的
+   `K^T@Z` 更新必须落回 FP32 fragment。
+4. `z_shared` 被三次覆盖：先写 R、再写 Z、最后写 `Z_end`。每次覆盖前，前一个消费者必须结束。
+5. `score_shared` 只保存已经完成 causal mask、scale 和 gate ratio 的 BF16 score。
+6. output 的旧 state contribution 与 in-chunk contribution 在同一个 FP32 `out` fragment 中累加，
+   只在最终 global store 时转成 BF16。
+7. 完整 chunk 的 `gamma_last=gamma[63]`；tail chunk 必须使用最后一个有效 token。
+8. invalid tail rows 的 residual 为零，invalid output 不写回，因此固定 64-row Tensor Core tile 不改变
+   有效 token 的数学结果。
+9. GVA 中 `bhg=floor(bh/(Hv/Hq))`，所以多个 value heads 共享 global Q/K head，但它们仍有独立的
+   V/g/beta/A/state/output。
+10. 当前没有 local/shared spilling。FP32 state 的精度跨 chunks 保留；BF16 误差只在 GEMM operand
+    snapshot 和最终 output 上引入。
+
+## 16. 当前已经做了什么、还没有做什么
+
+| 项目 | 当前状态 |
+| --- | --- |
+| residual-first 数学变换 | 已实现 |
+| W/U global intermediate | 已消除 |
+| `gamma`、`1/gamma`、`gamma_last` 缓存 | 已实现 |
+| Q/K/V/A/g/beta 两阶段预取 | 已实现 |
+| ping-pong physical shared storage | 由 `T.Pipelined` lowering 生成 |
+| low-parallel / normal specialization | 只有入口和 kernel 名，body 尚未分化 |
+| MHA / GVA specialization | 只有 kernel 名，尚未复用 GVA 的 Q/K work |
+| `dv` 分片增加 grid | 尚未实现 |
+| triangular GEMM 跳过上三角 tile | 尚未实现 |
+| warp specialization / TMA multicast | 尚未实现 |
+| 跨 chunk affine scan / WY form | 尚未实现 |
+
+因此，当前算法可以概括为：一个 block 持久拥有一个完整 FP32 state，使用六次 Tensor Core GEMM 完成
+一个 chunk 的 residual correction、causal output 和 state transition；gate 的指数只算一次，下一
+chunk 的只读输入通过 shared-memory ping-pong 预取，但 state chain 本身仍然严格串行。
 
