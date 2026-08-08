@@ -191,34 +191,48 @@ async stage 隐藏 latency。
 
 ## 9. Profile 结果与原始文件
 
-最终 D32 `chain_equal` profile：
+最终 D32 `chain_equal` full profile：
 
-- Nsight Compute 报告：`output/ncu_memopt_final_chain.ncu-rep`
-- 同次采集日志：`output/ncu_memopt_final_chain_58431.log`
-- profiled duration：615.264 us
+- Nsight Compute 报告：`output/ncu_full_chain_warp.ncu-rep`
+- 同次采集日志：`output/ncu_full_chain_warp_58723.log`
+- 采集方式：NCU `--set full`、显式增加 `PmSampling_WarpStates`、嵌入可用 source，47 passes
+- profiled duration：624.67 us
 - registers：112/thread
 - dynamic shared：112.144 KiB/block
-- theoretical / achieved occupancy：25.0% / 14.542%
-- sampling：10763 total，`long_scoreboard=3033`，`barrier=2837`，`wait=1190`
-- DRAM throughput：65.257 GB/s
+- theoretical / achieved occupancy：25.0% / 14.53%
+- scheduler cycles：`one-or-more eligible=29.42%`，`no eligible=70.58%`
+- Warp State Statistics not-issued samples：`long_scoreboard=2922`，`barrier=2542`，
+  `short_scoreboard=818`，`wait=807`，`mio_throttle=194`，`warpgroup_arrive=57`
+- Warp cycles per issued instruction：7.71
+- DRAM throughput：63.56 GB/s
 - global excessive sectors：98304
 
 修改前 K-only D32 为 766.85 us、114 registers/thread、82.70 KiB dynamic shared、
 7602 long-scoreboard samples 和 360448 excessive sectors。最终版本把 duration 缩短 1.246x，
 long-scoreboard samples 降低 60.1%，excessive sectors 降低 72.7%。
 
-最终 D128 `wide_gva_state` profile：
+最终 D128 `wide_gva_state` full profile：
 
-- Nsight Compute 报告：`output/ncu_memopt_final_wide.ncu-rep`
-- 同次采集日志：`output/ncu_memopt_final_wide_58451.log`
-- profiled duration：3.830304 ms
+- Nsight Compute 报告：`output/ncu_full_wide_warp.ncu-rep`
+- 同次采集日志：`output/ncu_full_wide_warp_58733.log`
+- 采集方式：NCU `--set full`、显式增加 `PmSampling_WarpStates`、嵌入可用 source，47 passes
+- profiled duration：3.80 ms
 - registers：208/thread
 - dynamic shared：173.584 KiB/block
 - theoretical / achieved occupancy：12.5% / 12.5%
+- scheduler cycles：`one-or-more eligible=24.09%`，`no eligible=75.91%`
+- Warp State Statistics not-issued samples：`barrier=22544`，`long_scoreboard=17398`，
+  `short_scoreboard=6797`，`wait=4256`，`mio_throttle=3611`，`warpgroup_arrive=247`
+- Warp cycles per issued instruction：8.21
 - grid：64 blocks，4.57 waves
 
-D32 当前 `long_scoreboard` 与 barrier 已同量级；DRAM throughput 只有峰值的约 25.6%，
-Tensor 与 shared pipeline active 都约 11.4%。所以继续增加同类 ping-pong buffer 不再是首选方向。
+两个报告均实际包含 Speed of Light/roofline、PM Sampling、PM Sampling Warp States、Compute、
+Memory Workload、Scheduler、Warp State Statistics、Instruction、Launch、Occupancy、Workload
+Distribution 和 Source Counters。H800 MIG 无权采集属于共享 GPU 单元的 14 个 PCIe/CTC metrics；
+NCU 会报告这些指标 unavailable，其余当前实例可访问的 full-set metrics 均已采集。
+
+D32 当前 `long_scoreboard` 与 barrier 已同量级；DRAM throughput 只有峰值的约 24.9%，
+Tensor pipeline active 约 11.4%。所以继续增加同类 ping-pong buffer 不再是首选方向。
 
 ## 10. 完整 8-case 结果
 
