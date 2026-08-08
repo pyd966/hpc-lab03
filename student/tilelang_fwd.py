@@ -77,23 +77,26 @@ def tilelang_residual_first(
             j % 16 // 8 * 4 + i % 16 // 8 * 2 + j % 2
         ),
     )
-    if dv_tile == 32:
+    use_grouped_g0 = dv_tile == 32 and os.environ.get(
+        "GDN_GROUPED_G0", "0"
+    ) != "0"
+    if use_grouped_g0:
         pipeline_order = [
-            3, 0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+            6, 0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15,
             16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
         ]
         pipeline_stage = [
-            1, 0, 0, 0, 1, 1, a_pipeline_stage, 1, 1, 1, 1, 1, 1, 1,
+            1, 0, 0, 0, 0, 0, a_pipeline_stage, 1, 1, 1, 1, 1, 1, 1,
             1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
         ]
     else:
         pipeline_order = [
-            3, 0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+            6, 0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15,
             16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
             30,
         ]
         pipeline_stage = [
-            1, 0, 0, 0, 1, 1, a_pipeline_stage, 1, 1, 1, 1, 1, 1, 1,
+            1, 0, 0, 0, 0, 0, a_pipeline_stage, 1, 1, 1, 1, 1, 1, 1,
             1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
         ]
 
@@ -179,24 +182,8 @@ def tilelang_residual_first(
             else:
                 T.clear(state)
 
-            # Q and V have only one shared-memory buffer. Their next chunks are
-            # loaded after the current chunk reaches its final consumer.
-            T.copy(
-                q[bb, 0:CHUNK_SIZE, bhg, 0:HEAD_DIM_K],
-                q_shared,
-            )
-            T.copy(
-                v[
-                    bb,
-                    0:CHUNK_SIZE,
-                    bh,
-                    dv_left : dv_left + dv_tile,
-                ],
-                v_shared,
-            )
-
-            # K remains loop-pipelined. Q and V use explicit single-buffer
-            # prefetches after their final current-chunk consumers.
+            # Keep Q/K/V in the software pipeline so their double-buffered
+            # copies overlap the preceding chunk's computation.
             for chunk in T.Pipelined(
                 chunks_per_batch,
                 order=pipeline_order,
@@ -207,11 +194,28 @@ def tilelang_residual_first(
 
                 T.copy(state, state_shared)
                 T.copy(
+                    q[bb, left : left + CHUNK_SIZE, bhg, 0:HEAD_DIM_K],
+                    q_shared,
+                )
+                T.copy(
                     k[bb, left : left + CHUNK_SIZE, bhg, 0:HEAD_DIM_K],
                     k_shared,
                 )
+                T.copy(
+                    v[
+                        bb,
+                        left : left + CHUNK_SIZE,
+                        bh,
+                        dv_left : dv_left + dv_tile,
+                    ],
+                    v_shared,
+                )
                 T.copy(g[bb, left : left + CHUNK_SIZE, bh], g_shared)
                 T.copy(beta[bb, left : left + CHUNK_SIZE, bh], beta_shared)
+                T.copy(
+                    a[bb, left : left + CHUNK_SIZE, bh, 0:CHUNK_SIZE],
+                    a_shared,
+                )
 
                 if right <= num_tokens:
                     g_last_exp[0] = T.exp2(
@@ -225,16 +229,9 @@ def tilelang_residual_first(
                 for dim_k, dim_v in T.Parallel(HEAD_DIM_K, dv_tile):
                     state[dim_k, dim_v] *= g_last_exp[0]
 
-                # A is independent of G0/G1/G2 and is available when the
-                # residual consumes z immediately after the combined group.
-                T.copy(
-                    a[bb, left : left + CHUNK_SIZE, bh, 0:CHUNK_SIZE],
-                    a_shared,
-                )
-
                 # G0 commits first, performs all independent gate work, and
                 # waits only at the boundary where z becomes the next operand.
-                if dv_tile == 32:
+                if use_grouped_g0:
                     T.call_extern(
                         "handle",
                         "student_wgmma_g0_gamma",
@@ -285,16 +282,6 @@ def tilelang_residual_first(
                     transpose_B=True,
                     clear_accum=True,
                 )
-                if chunk + 1 < chunks_per_batch:
-                    T.copy(
-                        v[
-                            bb,
-                            right : right + CHUNK_SIZE,
-                            bh,
-                            dv_left : dv_left + dv_tile,
-                        ],
-                        v_shared,
-                    )
                 T.copy(z, z_shared)
                 T.wgmma_gemm(
                     a_shared,
@@ -306,16 +293,6 @@ def tilelang_residual_first(
                 # G1 and G2 must be complete before their accumulators are
                 # transformed. G3 may continue while this work executes.
                 T.wait_wgmma(1)
-                if chunk + 1 < chunks_per_batch:
-                    T.copy(
-                        q[
-                            bb,
-                            right : right + CHUNK_SIZE,
-                            bhg,
-                            0:HEAD_DIM_K,
-                        ],
-                        q_shared,
-                    )
                 for token, dim in T.Parallel(CHUNK_SIZE, dv_tile):
                     out[token, dim] *= SCALE * g_exp_shared[token]
 
