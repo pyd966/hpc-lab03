@@ -17,10 +17,16 @@ SCALE = HEAD_DIM_K**-0.5
 USE_DOCUMENT_FORM = os.environ.get("GDN_IMPL", "residual") == "document"
 DV_SPLIT_MODE = os.environ.get("GDN_DV_SPLIT", "auto")
 PREFETCH_MODE = os.environ.get("GDN_PREFETCH", "auto")
+MEMORY_IO_MODE = os.environ.get("GDN_MEMORY_IO", "auto")
 DV_SPLIT_CONFIGS = {
     "off": (HEAD_DIM_V, 1),
     "64": (64, 2),
     "32": (32, 4),
+}
+PREFETCH_INPUTS = {
+    "off": (False, False, False, False),
+    "qkv": (True, True, True, False),
+    "qkva": (True, True, True, True),
 }
 
 
@@ -251,6 +257,233 @@ def tilelang_residual_first(
 
     return kernel
 
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    },
+)
+def tilelang_residual_first_full_chunks(
+    H,
+    Hg,
+    qk_dtype,
+    v_dtype,
+    gate_dtype,
+    accum_dtype,
+    use_initial_state,
+    dv_tile,
+    dv_parts,
+    prefetch_q,
+    prefetch_k,
+    prefetch_v,
+    prefetch_a,
+):
+    """Fast path for sequence lengths divisible by CHUNK_SIZE."""
+    batch_size = T.dynamic("batch_size")
+    num_tokens = T.dynamic("num_tokens")
+    qk_shape = (batch_size, num_tokens, Hg, HEAD_DIM_K)
+    v_shape = (batch_size, num_tokens, H, HEAD_DIM_V)
+    gate_shape = (batch_size, num_tokens, H)
+    a_shape = (batch_size, num_tokens, H, CHUNK_SIZE)
+    state_shape = (batch_size, H, HEAD_DIM_K, HEAD_DIM_V)
+    initial_shape = state_shape if use_initial_state else (1,)
+    q_stage = 0 if prefetch_q else 1
+    k_stage = 0 if prefetch_k else 1
+    v_stage = 0 if prefetch_v else 1
+    a_stage = 0 if prefetch_a else 1
+    prefetch_inputs = prefetch_q or prefetch_k or prefetch_v or prefetch_a
+    gate_stage = 0 if prefetch_inputs else 1
+    pipeline_order = [6, 0, 1, 2, 3, 4, 5] + list(range(7, 26))
+    pipeline_stage = [
+        1,
+        q_stage,
+        k_stage,
+        v_stage,
+        a_stage,
+        gate_stage,
+        gate_stage,
+    ] + [1] * 19
+    attention_name = "gva" if H != Hg else "mha"
+    prefetch_tag = (
+        ("q" if prefetch_q else "")
+        + ("k" if prefetch_k else "")
+        + ("v" if prefetch_v else "")
+        + ("a" if prefetch_a else "")
+    )
+    if not prefetch_tag:
+        prefetch_tag = "none"
+    kernel_name = (
+        "residual_"
+        + attention_name
+        + "_dv"
+        + str(dv_tile)
+        + "x"
+        + str(dv_parts)
+        + "_io_"
+        + prefetch_tag
+    )
+
+    @T.prim_func
+    def kernel(
+        q: T.Tensor(qk_shape, dtype=qk_dtype),
+        k: T.Tensor(qk_shape, dtype=qk_dtype),
+        v: T.Tensor(v_shape, dtype=v_dtype),
+        g: T.Tensor(gate_shape, dtype=gate_dtype),
+        beta: T.Tensor(gate_shape, dtype=gate_dtype),
+        a: T.Tensor(a_shape, dtype=qk_dtype),
+        initial_state: T.Tensor(initial_shape, dtype=accum_dtype),
+        output: T.Tensor(v_shape, dtype=v_dtype),
+        final_state: T.Tensor(state_shape, dtype=accum_dtype),
+        chunks_per_batch: T.int32,
+    ):
+        T.func_attr({"global_symbol": kernel_name})
+        with T.Kernel(batch_size * H * dv_parts, threads=256) as (block,):
+            owner = block // dv_parts
+            dv_part = block % dv_parts
+            bb = owner // H
+            bh = owner % H
+            bhg = bh // (H // Hg)
+            dv_left = dv_part * dv_tile
+
+            q_shared = T.alloc_shared((CHUNK_SIZE, HEAD_DIM_K), dtype=qk_dtype)
+            k_shared = T.alloc_shared((CHUNK_SIZE, HEAD_DIM_K), dtype=qk_dtype)
+            v_shared = T.alloc_shared((CHUNK_SIZE, dv_tile), dtype=v_dtype)
+            a_shared = T.alloc_shared((CHUNK_SIZE, CHUNK_SIZE), dtype=qk_dtype)
+            z_shared = T.alloc_shared((CHUNK_SIZE, dv_tile), dtype=v_dtype)
+            state_shared = T.alloc_shared(
+                (HEAD_DIM_K, dv_tile), dtype=v_dtype
+            )
+            score_shared = T.alloc_shared(
+                (CHUNK_SIZE, CHUNK_SIZE), dtype=qk_dtype
+            )
+            g_shared = T.alloc_shared((CHUNK_SIZE,), dtype=gate_dtype)
+            gamma_shared = T.alloc_shared((CHUNK_SIZE,), dtype=gate_dtype)
+            inv_gamma_shared = T.alloc_shared((CHUNK_SIZE,), dtype=gate_dtype)
+            beta_shared = T.alloc_shared((CHUNK_SIZE,), dtype=gate_dtype)
+            gamma_last = T.alloc_shared((1,), dtype=gate_dtype)
+
+            state = T.alloc_fragment(
+                (HEAD_DIM_K, dv_tile), dtype=accum_dtype
+            )
+            z = T.alloc_fragment((CHUNK_SIZE, dv_tile), dtype=accum_dtype)
+            out = T.alloc_fragment((CHUNK_SIZE, dv_tile), dtype=accum_dtype)
+            score = T.alloc_fragment(
+                (CHUNK_SIZE, CHUNK_SIZE), dtype=accum_dtype
+            )
+
+            if use_initial_state:
+                T.copy(
+                    initial_state[
+                        bb,
+                        bh,
+                        0:HEAD_DIM_K,
+                        dv_left : dv_left + dv_tile,
+                    ],
+                    state,
+                )
+            else:
+                T.clear(state)
+
+            for chunk in T.Pipelined(
+                chunks_per_batch,
+                order=pipeline_order,
+                stage=pipeline_stage,
+            ):
+                left = chunk * CHUNK_SIZE
+                right = left + CHUNK_SIZE
+
+                T.copy(state, state_shared)
+                T.copy(q[bb, left:right, bhg, 0:HEAD_DIM_K], q_shared)
+                T.copy(k[bb, left:right, bhg, 0:HEAD_DIM_K], k_shared)
+                T.copy(
+                    v[
+                        bb,
+                        left:right,
+                        bh,
+                        dv_left : dv_left + dv_tile,
+                    ],
+                    v_shared,
+                )
+                T.copy(a[bb, left:right, bh, 0:CHUNK_SIZE], a_shared)
+                T.copy(g[bb, left:right, bh], g_shared)
+                T.copy(beta[bb, left:right, bh], beta_shared)
+                for token in T.Parallel(CHUNK_SIZE):
+                    gamma_shared[token] = T.exp2(
+                        g_shared[token] * LOG2E
+                    )
+                    inv_gamma_shared[token] = 1.0 / gamma_shared[token]
+                gamma_last[0] = gamma_shared[CHUNK_SIZE - 1]
+
+                T.gemm(k_shared, state_shared, z, clear_accum=True)
+                for token, dim in T.Parallel(CHUNK_SIZE, dv_tile):
+                    z[token, dim] = beta_shared[token] * (
+                        v_shared[token, dim]
+                        - gamma_shared[token] * z[token, dim]
+                    )
+                T.copy(z, z_shared)
+                T.gemm(a_shared, z_shared, z, clear_accum=True)
+                T.copy(z, z_shared)
+
+                T.gemm(q_shared, state_shared, out, clear_accum=True)
+                for token, dim in T.Parallel(CHUNK_SIZE, dv_tile):
+                    out[token, dim] *= SCALE * gamma_shared[token]
+
+                T.gemm(
+                    q_shared,
+                    k_shared,
+                    score,
+                    transpose_B=True,
+                    clear_accum=True,
+                )
+                for row, col in T.Parallel(CHUNK_SIZE, CHUNK_SIZE):
+                    if row >= col:
+                        score[row, col] *= (
+                            SCALE
+                            * gamma_shared[row]
+                            * inv_gamma_shared[col]
+                        )
+                    else:
+                        score[row, col] = 0
+                T.copy(score, score_shared)
+                T.gemm(score_shared, z_shared, out, clear_accum=False)
+
+                T.copy(out, z_shared)
+                T.copy(
+                    z_shared,
+                    output[
+                        bb,
+                        left:right,
+                        bh,
+                        dv_left : dv_left + dv_tile,
+                    ],
+                )
+
+                for dim_k, dim_v in T.Parallel(HEAD_DIM_K, dv_tile):
+                    state[dim_k, dim_v] *= gamma_last[0]
+                for token, dim in T.Parallel(CHUNK_SIZE, dv_tile):
+                    z[token, dim] *= (
+                        gamma_last[0] * inv_gamma_shared[token]
+                    )
+                T.copy(z, z_shared)
+                T.gemm(
+                    k_shared,
+                    z_shared,
+                    state,
+                    transpose_A=True,
+                    clear_accum=False,
+                )
+
+            T.copy(
+                state,
+                final_state[
+                    bb,
+                    bh,
+                    0:HEAD_DIM_K,
+                    dv_left : dv_left + dv_tile,
+                ],
+            )
+
+    return kernel
+
 
 # q/k: [B, T, Hq, 128] BF16
 # v: [B, T, Hv, 128] BF16
@@ -307,23 +540,56 @@ def gdn_prefill_forward(
         dv_tile, dv_parts = DV_SPLIT_CONFIGS.get(
             DV_SPLIT_MODE, DV_SPLIT_CONFIGS["off"]
         )
-    # The extra K stage pays off only on the long, dv-split path in the scan.
-    if PREFETCH_MODE == "auto":
-        prefetch_k = dv_parts > 1 and chunks_per_batch >= 64
+    full_chunks_only = num_tokens % CHUNK_SIZE == 0
+    if MEMORY_IO_MODE == "auto":
+        use_memory_io = full_chunks_only
     else:
-        prefetch_k = PREFETCH_MODE == "on"
-    recurrent = tilelang_residual_first(
-        num_heads_v,
-        num_heads_qk,
-        qk_dtype=q.dtype,
-        v_dtype=v.dtype,
-        gate_dtype=g_cumsum.dtype,
-        accum_dtype="float32",
-        use_initial_state=use_initial_state,
-        dv_tile=dv_tile,
-        dv_parts=dv_parts,
-        prefetch_k=prefetch_k,
-    )
+        use_memory_io = MEMORY_IO_MODE == "on" and full_chunks_only
+    # TileLang requires all async producers of a consumer in one stage.
+    if PREFETCH_MODE in ("on", "k", "qk"):
+        use_memory_io = False
+    if use_memory_io:
+        if PREFETCH_MODE == "auto":
+            prefetch_profile = "qkva"
+        elif PREFETCH_MODE == "on":
+            prefetch_profile = "k"
+        else:
+            prefetch_profile = PREFETCH_MODE
+        prefetch_q, prefetch_k, prefetch_v, prefetch_a = (
+            PREFETCH_INPUTS.get(prefetch_profile, PREFETCH_INPUTS["off"])
+        )
+        recurrent = tilelang_residual_first_full_chunks(
+            num_heads_v,
+            num_heads_qk,
+            qk_dtype=q.dtype,
+            v_dtype=v.dtype,
+            gate_dtype=g_cumsum.dtype,
+            accum_dtype="float32",
+            use_initial_state=use_initial_state,
+            dv_tile=dv_tile,
+            dv_parts=dv_parts,
+            prefetch_q=prefetch_q,
+            prefetch_k=prefetch_k,
+            prefetch_v=prefetch_v,
+            prefetch_a=prefetch_a,
+        )
+    else:
+        if PREFETCH_MODE == "auto":
+            prefetch_k = dv_parts > 1 and chunks_per_batch >= 64
+        else:
+            prefetch_k = PREFETCH_MODE in ("on", "k")
+        recurrent = tilelang_residual_first(
+            num_heads_v,
+            num_heads_qk,
+            qk_dtype=q.dtype,
+            v_dtype=v.dtype,
+            gate_dtype=g_cumsum.dtype,
+            accum_dtype="float32",
+            use_initial_state=use_initial_state,
+            dv_tile=dv_tile,
+            dv_parts=dv_parts,
+            prefetch_k=prefetch_k,
+        )
     recurrent(
         q,
         k,

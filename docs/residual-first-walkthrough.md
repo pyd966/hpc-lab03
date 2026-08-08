@@ -2,8 +2,8 @@
 
 本文讲解当前 [student/tilelang_fwd.py](../student/tilelang_fwd.py) 中默认启用的 residual-first
 实现。目标是同时回答三件事：它在数学上算什么、为什么与实验文档公式等价、每一步最终如何映射到
-当前 GPU kernel。当前版本包含两项优化：第一，在每个 chunk 的输入准备阶段预计算 `gamma`、
-`1/gamma` 和 `gamma_last`；第二，把独立的 value 列切成多个 `dv` slice，由多个 CTA 并行维护。
+当前 GPU kernel。当前版本依次包含 gamma 预计算、沿 dv 拆分、K-only ping-pong，以及完整 chunk
+的 Q/K/V/A/g/beta 全输入流水与合并 output 写回；尾块继续使用经过验证的 predicated fallback。
 
 ## 1. 问题、形状与符号
 
@@ -854,4 +854,250 @@ vectorized `T.copy` 以及测量波动，不能归因于跨 chunk prefetch。完
 
 这些项目分别对应 pipeline、shared-memory capacity/layout、Tensor Core、GVA reuse 和 grid-level
 parallelism。后续每次改动都应先明确它针对哪一项，再用相同 case 的 benchmark 与 NCU/NSYS 数据验证。
+
+## 19. 优化 4：完整 chunk 的全输入流水与合并 output 写回
+
+本节描述提交 `e9bb60a` 之后的本轮版本，并覆盖第 10、11 节中关于“当前搬运路径”的旧描述。
+前面的章节仍保留，作为各次优化的历史和消融依据。
+
+### 19.1 目标、fast path 与自动分派
+
+NCU 对 `chain_equal` 的 K-only 版本显示，`long_scoreboard` 仍占全部 stall samples 的约
+47.8%。source-correlated SASS 进一步表明，约 65.3% 的 not-issued long-scoreboard 样本来自
+Q 的 `LDG.E.128 -> STS.128` load-to-use chain，约 14.9% 来自 A，约 7.2% 来自 V；K 已经走
+`LDGSTS/cp.async`，不是剩余主因。
+
+新版本增加 `tilelang_residual_first_full_chunks`。wrapper 的规则是：
+
+```text
+num_tokens % 64 == 0:
+    use full-chunk vector-I/O kernel
+    default prefetch profile = Q + K + V + A + g + beta
+otherwise:
+    use the existing predicated K-only kernel
+```
+
+8 个公开 case 中，除 `short_tail_state(T=1025)` 外都走新 fast path。尾块 fallback 保留旧版本
+逐 row predicate、无效 row 补零以及动态 `gamma_last` 处理，避免为了一个尾块把 full-chunk 主循环
+重新引入边界判断。`GDN_MEMORY_IO=off` 可强制旧 kernel；`GDN_PREFETCH=off|qkv|qkva` 用于
+新 kernel 消融。旧的 `GDN_PREFETCH=on|k` 仍安全地回到 K-only kernel。
+
+### 19.2 从 Python 调用到 kernel launch
+
+进入 `gdn_prefill_forward` 时，Q/K/V/g/beta/A/initial-state 已经是 CUDA tensors；CPU 到 HBM
+的输入准备不在学生核心 forward 内发生。wrapper 在 host 端完成：
+
+1. 读取 `B,T,Hq,Hv`，计算 `chunks_per_batch=ceil(T/64)`。
+2. 按原有策略选择 `D/P=32/4` 或 `128/1`。只有 `chain_equal` 自动采用 `32/4`。
+3. 在 HBM 中分配 BF16 `output[B,T,Hv,128]` 和 FP32
+   `final_state[B,Hv,128,128]`。
+4. 选择已经按 H/Hg、dtype、initial-state、D/P 和 prefetch profile 专门化的 JIT kernel。
+5. 发起一次 kernel launch。launch 仍为：
+
+```text
+grid.x  = B * Hv * P
+block.x = 256 threads = 8 warps
+```
+
+CTA `block` 解码为：
+
+```text
+owner   = block // P
+dv_part = block % P
+bb      = owner // Hv
+bh      = owner % Hv
+bhg     = bh // (Hv/Hq)
+dv_left = dv_part * D
+```
+
+一个 CTA 独占一个 `[128,D]` recurrent-state slice。不同 CTA 的 output/final-state 写区间互不
+重叠，因此没有跨 CTA reduction 或同步；chunk chain 仍在 CTA 内串行。
+
+### 19.3 Fragment 与 shared-memory 分配
+
+fragment shape 没有变化：
+
+| fragment | shape/dtype | source-level data |
+| --- | ---: | ---: |
+| `state` | `[128,D]` FP32 | `512D` B |
+| `z` | `[64,D]` FP32 | `256D` B |
+| `out` | `[64,D]` FP32 | `256D` B |
+| `score` | `[64,64]` FP32 | 16 KiB |
+
+合计仍是 `16 KiB + D KiB`：D32 为 48 KiB，D64 为 80 KiB，D128 为 144 KiB。它表示分布在
+256 threads 上的逻辑 register tile，不是每线程都持有完整数据。
+
+新 kernel 的显式单-stage shared buffers 为：
+
+| buffer | shape/dtype | D32 | D128 | 生命周期/用途 |
+| --- | ---: | ---: | ---: | --- |
+| `q_shared` | `[64,128]` BF16 | 16 KiB | 16 KiB | Q operand |
+| `k_shared` | `[64,128]` BF16 | 16 KiB | 16 KiB | K operand |
+| `v_shared` | `[64,D]` BF16 | 4 KiB | 16 KiB | V slice |
+| `a_shared` | `[64,64]` BF16 | 8 KiB | 8 KiB | A operand |
+| `z_shared` | `[64,D]` BF16 | 4 KiB | 16 KiB | Z、output staging、decayed Z 复用 |
+| `state_shared` | `[128,D]` BF16 | 8 KiB | 32 KiB | state Tensor Core operand |
+| `score_shared` | `[64,64]` BF16 | 8 KiB | 8 KiB | gated causal score |
+| `g_shared` | `[64]` FP32 | 256 B | 256 B | global g staging |
+| `gamma_shared` | `[64]` FP32 | 256 B | 256 B | exp(g) |
+| `inv_gamma_shared` | `[64]` FP32 | 256 B | 256 B | 1/exp(g) |
+| `beta_shared` | `[64]` FP32 | 256 B | 256 B | beta staging |
+| `gamma_last` | `[1]` FP32 | 4 B | 4 B | chunk-end decay |
+
+Q/K/V/A/g/beta 均为 stage-0 producer，pipeline lowering 为它们各增加一个 stage；z/state/score/gamma
+不跨迭代双缓冲。source-level 总量为：
+
+| 配置 | 单-stage 显式 shared | pipeline 额外 stage | lowering 前逻辑合计 |
+| --- | ---: | ---: | ---: |
+| D32/P4 | 65.004 KiB | 44.500 KiB | 109.504 KiB |
+| D64/P2 | 81.004 KiB | 48.500 KiB | 129.504 KiB |
+| D128/P1 | 113.004 KiB | 56.500 KiB | 169.504 KiB |
+
+目标路径修改前后资源实测为：
+
+| 路径 | source fragment | source pipelined shared | registers/thread | NCU dynamic shared/block | blocks/SM |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 修改前 D32 K-only | 48 KiB | 80.754 KiB | 114 | 82.70 KiB | 2 |
+| 当前 D32 all-input | 48 KiB | 109.504 KiB | 112 | 112.144 KiB | 2 |
+| 修改前 D128 no-prefetch | 144 KiB | 112.754 KiB | 202 | 115.47 KiB | 1 |
+| 当前 D128 all-input | 144 KiB | 169.504 KiB | 208 | 173.584 KiB | 1 |
+
+D32 增加 shared 但仍能容纳 2 blocks/SM；`chain_equal` 只有 16 blocks，实际平均仍约
+1.14 blocks/SM。D128 修改前已经因 registers/shared 限制为 1 block/SM，因此增加第二 stage
+没有进一步降低 residency。
+
+### 19.4 Pipeline prologue、steady state 与同步
+
+`T.Pipelined` 有 26 个顶层 statements。statement 1--6 的 Q/K/V/A/g/beta copy 统一属于
+stage 0，state copy、gate 变换、六次 GEMM、elementwise、output 和 state update 属于 stage 1。
+TileLang 当前要求一个 consumer 依赖的 async producers 位于同一 producer stage；只提前 Q/K、
+让 V/g/beta 留在另一个 async stage 会出现 wait-count lowering 错误。因此有效的流水组合是
+`QKVGbeta` 或 `QKVGbetaA`，而不是任意输入子集。
+
+pipeline prologue 对 chunk 0 执行：
+
+```text
+global Q [64,128] BF16 -> q_shared stage 0
+global K [64,128] BF16 -> k_shared stage 0
+global V [64,D]   BF16 -> v_shared stage 0
+global A [64,64]  BF16 -> a_shared stage 0
+global g/beta [64] FP32 -> g_shared/beta_shared stage 0
+commit async-copy group
+```
+
+实际 SASS 使用 `LDGSTS`/cp.async 路径，不使用 TMA；编译器对部分 swizzled copy 给出 TMA fallback
+提示后生成普通 async copy。global 地址首先查询 L2，L2 miss 才访问 HBM；代码不存在“每个 chunk
+显式从 HBM 搬到 L2”的指令。cp.async 的含义是把 global-memory load 的返回值直接送到 shared，
+并允许 warp 继续执行独立工作。
+
+steady state 中，pipeline 在当前 chunk 计算期间向另一组 shared stage 发出下一 chunk 的全部
+输入 copy。到当前输入第一次被消费前，lowering 插入统一的 `BAR.SYNC.DEFER_BLOCKING`/async wait。
+因此：
+
+- V 的 load latency 被前面的 state copy 和 `K@S` 覆盖；
+- A 的 latency被 `K@S`、residual 和 z materialization 覆盖；
+- Q 在 `Q@S`/`QK^T` 前已有更长 prefetch distance；
+- K 会被 `K@S`、`QK^T` 和 `K^T@Z` 三处复用；
+- g/beta 的物理布局为 `[B,T,H]`，固定-head 跨 token load 仍有 H-stride，但其 latency 被统一
+  async stage 隐藏。
+
+不能只把同步 load 改成 async 后立刻 wait；那只会把 long-scoreboard 改名为 barrier。本版本的
+wait 前确实有当前 chunk 的独立计算，且下一 chunk 使用不同 shared stage，不会覆盖当前 operand。
+
+### 19.5 每个 chunk 的完整计算和内存时序
+
+在 async 输入 wait 完成后，一个完整 chunk 按以下顺序执行：
+
+1. `state` FP32 fragment 转成 BF16，写 `state_shared[128,D]`。state 不能跨 chunk prefetch，
+   因为 `S_(c+1)` 依赖当前更新。
+2. `g_shared` 中的 64 个 FP32 值执行 `exp2(g*log2(e))`，写 `gamma_shared`；同时计算
+   `inv_gamma_shared`，并读取 row 63 形成 `gamma_last`。
+3. GEMM 1：`z = K @ state`，shape `[64,128]x[128,D]`，FP32 accumulate。
+4. Elementwise：`z = beta * (V - gamma*z)`，形成 raw residual；fragment 写 BF16
+   `z_shared`。
+5. GEMM 2：`z = A @ z_shared`，得到修正后的 Z；再次写 `z_shared`。
+6. GEMM 3：`out = Q @ state`，随后逐 row 乘 `scale*gamma`。
+7. GEMM 4：`score = Q @ K^T`；加入 lower-triangular mask、`scale` 和
+   `gamma[row]*inv_gamma[col]`，写 BF16 `score_shared`。
+8. GEMM 5：`out += score_shared @ z_shared`。
+9. output 写回分成两步。首先把 WGMMA `out` fragment 按 shared tile layout 重排到已不再被
+   GEMM 5 使用的 `z_shared`；随后 `T.copy(z_shared, output slice)` 生成合并的
+   shared-to-global store。这里复用现有 buffer，没有增加 shared allocation。
+10. `state *= gamma_last`；`z *= gamma_last*inv_gamma[row]`，把 decayed Z 写回
+    `z_shared`。
+11. GEMM 6：`state += K^T @ z_shared`。更新后的 FP32 state fragment 留在 registers 中，
+    直接进入下一 chunk。
+12. pipeline 同时保证下一 chunk 的输入 stage 已提交；当前 stage 完成最后一次 K 消费后才可
+    被后续迭代覆盖。
+
+pipeline epilogue 排空最后一组 async copy，只消费已经提交的最后一个 chunk，不会发越界的下一组
+copy。所有 chunks 完成后，CTA 把 `state[128,D]` FP32 fragment 写到自己独占的 global
+`final_state[...,dv_left:dv_left+D]`，随后 CTA 和 kernel 结束，wrapper 返回 output/final-state。
+
+### 19.6 组合消融
+
+代表 case 使用 5 warmups、20 repetitions；`I/O only` 的最初编译 smoke 使用 3/10，因此只作为
+方向判断：
+
+| 输入路径 | chain_equal ms | long_low_gva ms | wide_gva_state ms | 结论 |
+| --- | ---: | ---: | ---: | --- |
+| vector I/O only，无跨 chunk stage | 0.720688 | - | - | fast path 本身有效 |
+| Q/K/V/g/beta stage 0，A 当前 chunk | 0.654016 | 3.524432 | 4.250992 | 正确且明显提速 |
+| Q/K/V/A/g/beta 全部 stage 0 | 0.625472 | 3.208096 | 4.070224 | 三个 case 都最好，保留 |
+| 再加 shared-staged output | 0.643328 | - | 3.752480 | D32 持平，D128 继续显著改善 |
+
+短测受时钟和编译任务波动影响，最终判断以 10/100 正式结果为准。完整日志为
+`output/memopt_qkvg_scan_58357.log`、`output/memopt_qkvga_scan_58366.log` 和
+`output/memopt_output_stage_58422.log`。
+
+### 19.7 NCU：为什么 long-scoreboard 降低
+
+相同 `chain_equal` 的修改前 K-only 与最终版本：
+
+| 指标 | K-only | 最终 all-input + staged output | 变化 |
+| --- | ---: | ---: | ---: |
+| profiled duration | 766.85 us | 615.26 us | 1.2464x |
+| instructions | 13.680 M | 13.013 M | -4.9% |
+| registers/thread | 114 | 112 | -2 |
+| dynamic shared/block | 82.70 KiB | 112.144 KiB | +29.444 KiB |
+| theoretical / achieved occupancy | 25.0% / 14.30% | 25.0% / 14.54% | 基本不变 |
+| all long-scoreboard samples | 7602 | 3033 | -60.1% |
+| not-issued long-scoreboard | 7170 | 2859 | -60.1% |
+| long-scoreboard / all samples | 47.8% | 28.2% | -19.6 pp |
+| DRAM throughput | 48.52 GB/s | 65.26 GB/s | +34.5% |
+| excessive global sectors | 360448 | 98304 | -72.7% |
+
+旧版最高的 Q/A/V `LDG->STS` PC hotspots 已消失。最终 long-scoreboard 的最大单点是 async input
+组第一次消费前的统一 `BAR.SYNC.DEFER_BLOCKING`；这说明剩余等待已经从多个同步 load-to-use
+依赖集中到一个明确的 pipeline 边界。它仍是 latency stall，但发生次数和总 runtime 都显著下降。
+
+直接从 out fragment 写 global 时，四条 `STG.E` 占约 260096 个 excessive sectors。经
+`out -> z_shared -> global` 重排后，这部分全部消失；剩余约 97536 sectors 主要来自 g/beta
+固定-head stride load。由于接口布局为 `[B,T,H]`，单 head CTA 无法在不重复读取其他 heads 的
+情况下把相邻 token 变成物理连续地址。当前选择隐藏这部分 latency，而不为“表面合并”增加 H 倍数据。
+
+最终报告为 `output/ncu_memopt_final_chain.ncu-rep`；D128 资源报告为
+`output/ncu_memopt_final_wide.ncu-rep`。
+
+### 19.8 正式 8-case 时间、speedup 与预计分数
+
+baseline 是本轮修改前提交 `e9bb60a` 的 K-only 自动分派，日志
+`output/memopt_baseline_58343.log`。最终日志 `output/memopt_final_staged_58438.log`。
+二者都使用默认 10 warmups、100 repetitions、CUDA event 中位数；8 个 BF16 output 和 FP32
+final-state 正确性检查全部 PASS。
+
+| case | K-only baseline ms | final ms | speedup | `p=t100/t` | 预计分数 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `short_tail_state` | 0.140864 | 0.142048 | 0.9917x | 2.4361 | 120.00 |
+| `chain_equal` | 0.783488 | 0.650736 | 1.2040x | 0.7650 | 89.26 |
+| `parallel_equal` | 0.547600 | 0.413312 | 1.3249x | 1.2370 | 104.74 |
+| `parallel_gva` | 0.497008 | 0.397344 | 1.2508x | 1.2371 | 104.74 |
+| `long_low_gva` | 3.602192 | 3.195232 | 1.1274x | 0.5817 | 81.04 |
+| `batch_split_gva` | 2.792480 | 2.267488 | 1.2315x | 0.6757 | 85.00 |
+| `wide_gva_state` | 5.114848 | 3.802176 | 1.3452x | 0.6382 | 83.59 |
+| `deep_gva_state` | 5.791072 | 4.420480 | 1.3101x | 0.6404 | 83.57 |
+
+预计分数继续使用第 14 节声明的分段线性估算，不代表隐藏 case 的官方结果。公开 8 case 简单平均
+约为 **93.99 分**，上一提交的估计为 88.82。`short_tail_state` 走完全相同的 fallback，-0.8%
+属于跨任务测量波动；其余 7 个 full-chunk case 全部有 1.127x--1.345x 提升。
 
