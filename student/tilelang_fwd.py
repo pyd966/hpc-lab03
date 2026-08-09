@@ -550,8 +550,8 @@ def gdn_prefill_forward(
     if initial_state is None:
         initial_state = torch.empty((1,), dtype=torch.float32, device=v.device)
     full_chunks_only = num_tokens % CHUNK_SIZE == 0
+    state_owners = batch_size * num_heads_v
     if DV_SPLIT_MODE == "auto":
-        state_owners = batch_size * num_heads_v
         # D=64 has one warp group per CTA. It wins when both value parts
         # spread over a single 14-SM wave; 1..512 chunk sweeps show no
         # additional chain-length crossover on the full-chunk RS path.
@@ -590,9 +590,7 @@ def gdn_prefill_forward(
             if use_rs
             else tilelang_residual_first_full_chunks
         )
-        recurrent = kernel_factory(
-            num_heads_v,
-            num_heads_qk,
+        kernel_kwargs = dict(
             qk_dtype=q.dtype,
             v_dtype=v.dtype,
             gate_dtype=g_cumsum.dtype,
@@ -604,6 +602,16 @@ def gdn_prefill_forward(
             prefetch_k=prefetch_k,
             prefetch_v=prefetch_v,
             prefetch_a=prefetch_a,
+        )
+        if use_rs:
+            kernel_kwargs["reuse_output_shared"] = (
+                dv_tile == 64
+                and state_owners * dv_parts > MIG_SM_COUNT
+            )
+        recurrent = kernel_factory(
+            num_heads_v,
+            num_heads_qk,
+            **kernel_kwargs,
         )
     else:
         if PREFETCH_MODE == "auto":

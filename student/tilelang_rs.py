@@ -33,6 +33,7 @@ def tilelang_residual_first_full_chunks_rs(
     prefetch_k,
     prefetch_v,
     prefetch_a,
+    reuse_output_shared,
 ):
     """Full-chunk path with transposed recurrent fragments and RS WGMMA."""
     batch_size = T.dynamic("batch_size")
@@ -79,6 +80,7 @@ def tilelang_residual_first_full_chunks_rs(
         + str(dv_parts)
         + "_rs_io_"
         + prefetch_tag
+        + ("_reuse_so" if reuse_output_shared else "")
     )
 
     # Hopper WGMMA always covers 64 rows. Dispatch keeps D=32 on the SS path.
@@ -144,6 +146,8 @@ def tilelang_residual_first_full_chunks_rs(
     ):
         T.func_attr({"global_symbol": kernel_name})
         with T.Kernel(batch_size * H * dv_parts, threads=value_threads) as (block,):
+            if reuse_output_shared:
+                T.annotate_min_blocks_per_sm(2)
             owner = block // dv_parts
             dv_part = block % dv_parts
             bb = owner // H
@@ -155,12 +159,15 @@ def tilelang_residual_first_full_chunks_rs(
             k_shared = T.alloc_shared((CHUNK_SIZE, HEAD_DIM_K), dtype=qk_dtype)
             v_shared = T.alloc_shared((CHUNK_SIZE, dv_tile), dtype=v_dtype)
             a_shared = T.alloc_shared((CHUNK_SIZE, CHUNK_SIZE), dtype=qk_dtype)
-            output_shared = T.alloc_shared(
-                (CHUNK_SIZE, dv_tile), dtype=v_dtype
-            )
             score_shared = T.alloc_shared(
                 (CHUNK_SIZE, CHUNK_SIZE), dtype=qk_dtype
             )
+            if reuse_output_shared:
+                output_shared = score_shared
+            else:
+                output_shared = T.alloc_shared(
+                    (CHUNK_SIZE, dv_tile), dtype=v_dtype
+                )
             g_shared = T.alloc_shared((CHUNK_SIZE,), dtype=gate_dtype)
             gamma_shared = T.alloc_shared((CHUNK_SIZE,), dtype=gate_dtype)
             inv_gamma_shared = T.alloc_shared((CHUNK_SIZE,), dtype=gate_dtype)
@@ -260,7 +267,8 @@ def tilelang_residual_first_full_chunks_rs(
                         g_shared[token] * LOG2E
                     )
                     inv_gamma_shared[token] = 1.0 / gamma_shared[token]
-                gamma_last[0] = gamma_shared[CHUNK_SIZE - 1]
+                    if token == CHUNK_SIZE - 1:
+                        gamma_last[0] = gamma_shared[token]
                 for dim_v, dim_k in T.Parallel(dv_tile, HEAD_DIM_K):
                     state_t[dim_v, dim_k] *= gamma_last[0]
 
@@ -325,6 +333,9 @@ def tilelang_residual_first_full_chunks_rs(
                     clear_accum=False,
                     wg_wait=-1,
                 )
+                # G4 is the older committed group and is the only consumer of
+                # score_shared.  Retire it before reusing that storage while
+                # leaving the independent state update (G5) in flight.
                 T.warpgroup_wait(1)
                 for dim_v, token in T.Parallel(dv_tile, CHUNK_SIZE):
                     output_shared[token, dim_v] = out_t[dim_v, token]
@@ -345,4 +356,3 @@ def tilelang_residual_first_full_chunks_rs(
                 ]
 
     return kernel
-

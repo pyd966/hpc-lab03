@@ -24,9 +24,7 @@ def main() -> None:
         if args.rs
         else tilelang_residual_first_full_chunks
     )
-    kernel = kernel_factory(
-        heads,
-        qk_heads,
+    kernel_kwargs = dict(
         qk_dtype=torch.bfloat16,
         v_dtype=torch.bfloat16,
         gate_dtype=torch.float32,
@@ -39,6 +37,9 @@ def main() -> None:
         prefetch_v=True,
         prefetch_a=True,
     )
+    if args.rs:
+        kernel_kwargs["reuse_output_shared"] = args.dv == 64
+    kernel = kernel_factory(heads, qk_heads, **kernel_kwargs)
     print(kernel.get_kernel_source())
 
 
