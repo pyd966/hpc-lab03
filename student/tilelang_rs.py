@@ -195,12 +195,14 @@ def tilelang_residual_first_full_chunks_rs(
 
             q_layout = make_full_bank_swizzled_layout(q_shared)
             k_layout = make_full_bank_swizzled_layout(k_shared)
+            v_layout = make_full_bank_swizzled_layout(v_shared)
             a_layout = make_full_bank_swizzled_layout(a_shared)
             score_layout = make_full_bank_swizzled_layout(score_shared)
             T.annotate_layout(
                 {
                     q_shared: q_layout,
                     k_shared: k_layout,
+                    v_shared: v_layout,
                     a_shared: a_layout,
                     score_shared: score_layout,
                     state_operand: project_rs.make_mma_load_layout(state_operand),
