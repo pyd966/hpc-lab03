@@ -555,9 +555,7 @@ def gdn_prefill_forward(
         # D=64 has one warp group per CTA. It wins when both value parts
         # spread over a single 14-SM wave; 1..512 chunk sweeps show no
         # additional chain-length crossover on the full-chunk RS path.
-        split_profitable = (
-            full_chunks_only and state_owners * 2 <= MIG_SM_COUNT
-        )
+        split_profitable = state_owners * 2 <= MIG_SM_COUNT
         dv_tile, dv_parts = (
             DV_SPLIT_CONFIGS["64"]
             if split_profitable
@@ -567,10 +565,13 @@ def gdn_prefill_forward(
         dv_tile, dv_parts = DV_SPLIT_CONFIGS.get(
             DV_SPLIT_MODE, DV_SPLIT_CONFIGS["off"]
         )
+    rs_available = RS_MODE in ("auto", "on") and dv_tile >= 64
     if MEMORY_IO_MODE == "auto":
-        use_memory_io = full_chunks_only
+        use_memory_io = full_chunks_only or rs_available
     else:
-        use_memory_io = MEMORY_IO_MODE == "on" and full_chunks_only
+        use_memory_io = MEMORY_IO_MODE == "on" and (
+            full_chunks_only or rs_available
+        )
     # TileLang requires all async producers of a consumer in one stage.
     if PREFETCH_MODE in ("on", "k", "qk"):
         use_memory_io = False
@@ -584,7 +585,7 @@ def gdn_prefill_forward(
         prefetch_q, prefetch_k, prefetch_v, prefetch_a = (
             PREFETCH_INPUTS.get(prefetch_profile, PREFETCH_INPUTS["off"])
         )
-        use_rs = RS_MODE in ("auto", "on") and dv_tile >= 64
+        use_rs = rs_available
         kernel_factory = (
             tilelang_residual_first_full_chunks_rs
             if use_rs
@@ -608,6 +609,7 @@ def gdn_prefill_forward(
                 dv_tile == 64
                 and state_owners * dv_parts > MIG_SM_COUNT
             )
+            kernel_kwargs["has_tail"] = not full_chunks_only
         recurrent = kernel_factory(
             num_heads_v,
             num_heads_qk,

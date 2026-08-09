@@ -8,8 +8,8 @@
 
 set -euo pipefail
 
-if [[ $# -ne 3 ]]; then
-    echo "usage: $0 CASE KERNEL_NAME REPORT_BASENAME" >&2
+if [[ $# -lt 3 || $# -gt 4 ]]; then
+    echo "usage: $0 CASE KERNEL_NAME REPORT_BASENAME [CASES_CSV]" >&2
     exit 2
 fi
 
@@ -19,6 +19,10 @@ export PYTHONUNBUFFERED=1
 case_name=$1
 kernel_name=$2
 report_basename=$3
+case_file_args=()
+if [[ $# -eq 4 ]]; then
+    case_file_args=(--cases "$4")
+fi
 
 ncu \
     --set full \
@@ -30,5 +34,6 @@ ncu \
     --launch-count 1 \
     --force-overwrite \
     -o "$report_basename" \
-    python run.py --case "$case_name" --warmup 0 --repetitions 1 \
+    python run.py "${case_file_args[@]}" \
+        --case "$case_name" --warmup 0 --repetitions 1 \
         --output-format csv

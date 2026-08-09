@@ -34,8 +34,9 @@ def tilelang_residual_first_full_chunks_rs(
     prefetch_v,
     prefetch_a,
     reuse_output_shared,
+    has_tail,
 ):
-    """Full-chunk path with transposed recurrent fragments and RS WGMMA."""
+    """RS WGMMA path with a pipelined full prefix and one predicated tail."""
     batch_size = T.dynamic("batch_size")
     num_tokens = T.dynamic("num_tokens")
     qk_shape = (batch_size, num_tokens, Hg, HEAD_DIM_K)
@@ -81,6 +82,7 @@ def tilelang_residual_first_full_chunks_rs(
         + "_rs_io_"
         + prefetch_tag
         + ("_reuse_so" if reuse_output_shared else "")
+        + ("_tail" if has_tail else "")
     )
 
     # Hopper WGMMA always covers 64 rows. Dispatch keeps D=32 on the SS path.
@@ -173,6 +175,25 @@ def tilelang_residual_first_full_chunks_rs(
             inv_gamma_shared = T.alloc_shared((CHUNK_SIZE,), dtype=gate_dtype)
             beta_shared = T.alloc_shared((CHUNK_SIZE,), dtype=gate_dtype)
             gamma_last = T.alloc_shared((1,), dtype=gate_dtype)
+            if has_tail:
+                q_tail_shared = T.alloc_shared(
+                    (CHUNK_SIZE, HEAD_DIM_K), dtype=qk_dtype
+                )
+                k_tail_shared = T.alloc_shared(
+                    (CHUNK_SIZE, HEAD_DIM_K), dtype=qk_dtype
+                )
+                v_tail_shared = T.alloc_shared(
+                    (CHUNK_SIZE, dv_tile), dtype=v_dtype
+                )
+                a_tail_shared = T.alloc_shared(
+                    (CHUNK_SIZE, CHUNK_SIZE), dtype=qk_dtype
+                )
+                g_tail_shared = T.alloc_shared(
+                    (CHUNK_SIZE,), dtype=gate_dtype
+                )
+                beta_tail_shared = T.alloc_shared(
+                    (CHUNK_SIZE,), dtype=gate_dtype
+                )
 
             state_t = T.alloc_fragment(
                 (dv_tile, HEAD_DIM_K), dtype=accum_dtype
@@ -213,6 +234,15 @@ def tilelang_residual_first_full_chunks_rs(
                     score: score_ss.make_mma_store_layout(score),
                 }
             )
+            if has_tail:
+                T.annotate_layout(
+                    {
+                        q_tail_shared: q_layout,
+                        k_tail_shared: k_layout,
+                        v_tail_shared: v_layout,
+                        a_tail_shared: a_layout,
+                    }
+                )
             project_rs._assign_b_shared_layout(k_layout)
             correction_rs._assign_b_shared_layout(a_layout)
             update_rs._assign_b_shared_layout(k_layout)
@@ -226,8 +256,11 @@ def tilelang_residual_first_full_chunks_rs(
                         bb, bh, dim_k, dv_left + dim_v
                     ]
 
+            pipelined_chunks = (
+                num_tokens // CHUNK_SIZE if has_tail else chunks_per_batch
+            )
             for chunk in T.Pipelined(
-                chunks_per_batch,
+                pipelined_chunks,
                 order=pipeline_order,
                 stage=pipeline_stage,
             ):
@@ -350,6 +383,138 @@ def tilelang_residual_first_full_chunks_rs(
                         dv_left : dv_left + dv_tile,
                     ],
                 )
+                T.warpgroup_wait(0)
+
+            if has_tail:
+                left = pipelined_chunks * CHUNK_SIZE
+                valid_tokens = num_tokens - left
+
+                for token, dim_k in T.Parallel(
+                    CHUNK_SIZE, HEAD_DIM_K
+                ):
+                    if token < valid_tokens:
+                        q_tail_shared[token, dim_k] = q[
+                            bb, left + token, bhg, dim_k
+                        ]
+                        k_tail_shared[token, dim_k] = k[
+                            bb, left + token, bhg, dim_k
+                        ]
+                    else:
+                        q_tail_shared[token, dim_k] = 0
+                        k_tail_shared[token, dim_k] = 0
+                for token, dim_v in T.Parallel(CHUNK_SIZE, dv_tile):
+                    if token < valid_tokens:
+                        v_tail_shared[token, dim_v] = v[
+                            bb, left + token, bh, dv_left + dim_v
+                        ]
+                    else:
+                        v_tail_shared[token, dim_v] = 0
+                for row, col in T.Parallel(CHUNK_SIZE, CHUNK_SIZE):
+                    if row < valid_tokens:
+                        a_tail_shared[row, col] = a[bb, left + row, bh, col]
+                    else:
+                        a_tail_shared[row, col] = 0
+                for token in T.Parallel(CHUNK_SIZE):
+                    if token < valid_tokens:
+                        g_tail_shared[token] = g[bb, left + token, bh]
+                        beta_tail_shared[token] = beta[bb, left + token, bh]
+                    else:
+                        g_tail_shared[token] = 0
+                        beta_tail_shared[token] = 0
+
+                T.copy(state_t, state_operand)
+                project_rs.wgmma(
+                    state_operand[0:dv_tile, 0:HEAD_DIM_K],
+                    k_tail_shared[0:CHUNK_SIZE, 0:HEAD_DIM_K],
+                    z_t[0:dv_tile, 0:CHUNK_SIZE],
+                    clear_accum=True,
+                    wg_wait=-1,
+                )
+                project_rs.wgmma(
+                    state_operand[0:dv_tile, 0:HEAD_DIM_K],
+                    q_tail_shared[0:CHUNK_SIZE, 0:HEAD_DIM_K],
+                    out_t[0:dv_tile, 0:CHUNK_SIZE],
+                    clear_accum=True,
+                    wg_wait=-1,
+                )
+                for token in T.Parallel(CHUNK_SIZE):
+                    gamma_shared[token] = T.exp2(
+                        g_tail_shared[token] * LOG2E
+                    )
+                    inv_gamma_shared[token] = 1.0 / gamma_shared[token]
+                    if token == valid_tokens - 1:
+                        gamma_last[0] = gamma_shared[token]
+                for dim_v, dim_k in T.Parallel(dv_tile, HEAD_DIM_K):
+                    state_t[dim_v, dim_k] *= gamma_last[0]
+
+                T.warpgroup_wait(1)
+                for dim_v, token in T.Parallel(dv_tile, CHUNK_SIZE):
+                    z_t[dim_v, token] = beta_tail_shared[token] * (
+                        v_tail_shared[token, dim_v]
+                        - gamma_shared[token] * z_t[dim_v, token]
+                    )
+                T.copy(z_t, z_operand)
+                correction_rs.wgmma(
+                    z_operand[0:dv_tile, 0:CHUNK_SIZE],
+                    a_tail_shared[0:CHUNK_SIZE, 0:CHUNK_SIZE],
+                    z_t[0:dv_tile, 0:CHUNK_SIZE],
+                    clear_accum=True,
+                    wg_wait=-1,
+                )
+                score_ss.wgmma(
+                    q_tail_shared[0:CHUNK_SIZE, 0:HEAD_DIM_K],
+                    k_tail_shared[0:CHUNK_SIZE, 0:HEAD_DIM_K],
+                    score[0:CHUNK_SIZE, 0:CHUNK_SIZE],
+                    clear_accum=True,
+                    wg_wait=-1,
+                )
+
+                T.warpgroup_wait(1)
+                for dim_v, token in T.Parallel(dv_tile, CHUNK_SIZE):
+                    z_t[dim_v, token] *= (
+                        gamma_last[0] * inv_gamma_shared[token]
+                    )
+                T.copy(z_t, z_operand)
+
+                T.warpgroup_wait(0)
+                for dim_v, token in T.Parallel(dv_tile, CHUNK_SIZE):
+                    out_t[dim_v, token] *= (
+                        SCALE * gamma_shared[token]
+                    )
+                for row, col in T.Parallel(CHUNK_SIZE, CHUNK_SIZE):
+                    if row >= col and row < valid_tokens:
+                        score[row, col] *= (
+                            SCALE
+                            * gamma_shared[row]
+                            * inv_gamma_shared[valid_tokens - 1]
+                        )
+                    else:
+                        score[row, col] = 0
+                T.copy(score, score_shared)
+
+                correction_rs.wgmma(
+                    z_operand[0:dv_tile, 0:CHUNK_SIZE],
+                    score_shared[0:CHUNK_SIZE, 0:CHUNK_SIZE],
+                    out_t[0:dv_tile, 0:CHUNK_SIZE],
+                    clear_accum=False,
+                    wg_wait=-1,
+                )
+                update_rs.wgmma(
+                    z_operand[0:dv_tile, 0:CHUNK_SIZE],
+                    k_tail_shared[0:CHUNK_SIZE, 0:HEAD_DIM_K],
+                    state_t[0:dv_tile, 0:HEAD_DIM_K],
+                    clear_accum=False,
+                    wg_wait=-1,
+                )
+                T.warpgroup_wait(1)
+                for dim_v, token in T.Parallel(dv_tile, CHUNK_SIZE):
+                    if token < valid_tokens:
+                        output[
+                            bb,
+                            left + token,
+                            bh,
+                            dv_left + dim_v,
+                        ] = out_t[dim_v, token]
                 T.warpgroup_wait(0)
 
             for dim_v, dim_k in T.Parallel(dv_tile, HEAD_DIM_K):

@@ -10,6 +10,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dv", type=int, choices=(32, 64, 128), required=True)
     parser.add_argument("--rs", action="store_true")
+    parser.add_argument("--tail", action="store_true")
     args = parser.parse_args()
 
     if args.dv == 32:
@@ -38,6 +39,7 @@ def main() -> None:
         prefetch_a=True,
     )
     if args.rs:
+        kernel_kwargs["has_tail"] = args.tail
         kernel_kwargs["reuse_output_shared"] = args.dv == 64
     kernel = kernel_factory(heads, qk_heads, **kernel_kwargs)
     print(kernel.get_kernel_source())
