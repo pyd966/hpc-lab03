@@ -43,4 +43,24 @@ if [[ "${1:-}" == "--detach" ]]; then
     shift
 fi
 
-exec hpc "${hpc_args[@]}" ./job.sh "$worker_flag" "$@"
+# --export NONE keeps the worker reproducible, so forward only the kernel
+# tuning variables explicitly set by the caller.
+worker_cmd=(env)
+gdn_env_names=(
+    GDN_IMPL
+    GDN_DV_SPLIT
+    GDN_RS
+    GDN_PREFETCH
+    GDN_MEMORY_IO
+    GDN_GATE_CP
+    GDN_GATE_CP_THRESHOLD
+    GDN_GATE_CP_MIN_CHUNKS
+)
+for env_name in "${gdn_env_names[@]}"; do
+    if [[ -v "$env_name" ]]; then
+        worker_cmd+=("$env_name=${!env_name}")
+    fi
+done
+worker_cmd+=(./job.sh "$worker_flag" "$@")
+
+exec hpc "${hpc_args[@]}" "${worker_cmd[@]}"

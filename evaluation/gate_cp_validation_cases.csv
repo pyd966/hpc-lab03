@@ -1,0 +1,4 @@
+name,batch_size,seqlen,num_heads_qk,num_heads_v,use_initial_state,purpose,gate_mode
+cp_initial_random,1,8192,4,4,true,validation,random_decay
+cp_initial_mixed,1,8192,4,4,true,validation,mixed
+cp_low_head_initial,1,16384,1,1,true,validation,random_decay

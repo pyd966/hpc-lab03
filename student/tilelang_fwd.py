@@ -1,4 +1,5 @@
 # Residual-first baseline: Z = A @ (beta * (V - exp(g) * K @ S)).
+import math
 import os
 
 import torch
@@ -6,7 +7,11 @@ import tilelang
 import tilelang.language as T
 
 from student.tilelang_fwd_document import gdn_prefill_forward_document
-from student.tilelang_rs import tilelang_residual_first_full_chunks_rs
+from student.tilelang_rs import (
+    tilelang_get_gate_cp_warmup,
+    tilelang_prepare_gate_cp_states,
+    tilelang_residual_first_full_chunks_rs,
+)
 
 
 CHUNK_SIZE = 64
@@ -20,6 +25,9 @@ DV_SPLIT_MODE = os.environ.get("GDN_DV_SPLIT", "auto")
 RS_MODE = os.environ.get("GDN_RS", "auto")
 PREFETCH_MODE = os.environ.get("GDN_PREFETCH", "auto")
 MEMORY_IO_MODE = os.environ.get("GDN_MEMORY_IO", "auto")
+GATE_CP_MODE = os.environ.get("GDN_GATE_CP", "auto")
+GATE_CP_THRESHOLD = float(os.environ.get("GDN_GATE_CP_THRESHOLD", "-10.0"))
+GATE_CP_MIN_CHUNKS = int(os.environ.get("GDN_GATE_CP_MIN_CHUNKS", "128"))
 DV_SPLIT_CONFIGS = {
     "off": (HEAD_DIM_V, 1),
     "64": (64, 2),
@@ -510,6 +518,63 @@ def tilelang_residual_first_full_chunks(
     return kernel
 
 
+def _select_gate_cp_parts(
+    batch_size,
+    full_chunks_only,
+    rs_available,
+    base_blocks,
+    blocks_per_sm,
+    chunks_per_batch,
+):
+    """Choose power-of-two sequence parallelism from occupancy and chain length."""
+    if (
+        GATE_CP_MODE == "off"
+        or batch_size != 1
+        or not full_chunks_only
+        or not rs_available
+    ):
+        return 1
+
+    if GATE_CP_MODE in ("auto", "on"):
+        resident_slots = MIG_SM_COUNT * blocks_per_sm
+        if (
+            base_blocks >= resident_slots
+            or chunks_per_batch < GATE_CP_MIN_CHUNKS
+        ):
+            return 1
+        # FlashQLA's latency model minimizes
+        #   local_chunks + total_block_chunks / (slots * local_chunks).
+        # The empirical factor 3 and power-of-two rounding follow upstream;
+        # resident_slots is adapted to this 14-SM MIG and our CTA resources.
+        estimated_local_chunks = 3.0 * math.sqrt(
+            base_blocks * chunks_per_batch / resident_slots
+        )
+        local_chunks = 2 ** round(math.log2(estimated_local_chunks))
+        local_chunks = max(local_chunks, 4)
+        seq_parts = 1
+        while (
+            seq_parts < 8
+            and chunks_per_batch // seq_parts > local_chunks
+        ):
+            seq_parts *= 2
+        # Keep equal static slices; unsupported divisibility falls back by
+        # powers of two instead of adding a second tail specialization.
+        while seq_parts > 1 and chunks_per_batch % seq_parts != 0:
+            seq_parts //= 2
+        return seq_parts
+
+    try:
+        seq_parts = int(GATE_CP_MODE)
+    except ValueError:
+        return 1
+    if (
+        seq_parts not in (2, 4, 8)
+        or chunks_per_batch % seq_parts != 0
+    ):
+        return 1
+    return seq_parts
+
+
 # q/k: [B, T, Hq, 128] BF16
 # v: [B, T, Hv, 128] BF16
 # g_cumsum/beta: [B, T, Hv] FP32
@@ -549,6 +614,12 @@ def gdn_prefill_forward(
     use_initial_state = initial_state is not None
     if initial_state is None:
         initial_state = torch.empty((1,), dtype=torch.float32, device=v.device)
+    gate_cp_states = initial_state
+    gate_cp_warmup_counts = None
+    gate_cp_warmup = None
+    gate_cp_prepare = None
+    seq_parts = 1
+    use_rs = False
     full_chunks_only = num_tokens % CHUNK_SIZE == 0
     state_owners = batch_size * num_heads_v
     if DV_SPLIT_MODE == "auto":
@@ -586,6 +657,14 @@ def gdn_prefill_forward(
             PREFETCH_INPUTS.get(prefetch_profile, PREFETCH_INPUTS["off"])
         )
         use_rs = rs_available
+        seq_parts = _select_gate_cp_parts(
+            batch_size=batch_size,
+            full_chunks_only=full_chunks_only,
+            rs_available=use_rs,
+            base_blocks=state_owners * dv_parts,
+            blocks_per_sm=2 if dv_tile == 64 else 1,
+            chunks_per_batch=chunks_per_batch,
+        )
         kernel_factory = (
             tilelang_residual_first_full_chunks_rs
             if use_rs
@@ -607,9 +686,48 @@ def gdn_prefill_forward(
         if use_rs:
             kernel_kwargs["reuse_output_shared"] = (
                 dv_tile == 64
-                and state_owners * dv_parts > MIG_SM_COUNT
+                and (
+                    state_owners * dv_parts > MIG_SM_COUNT
+                    or seq_parts > 1
+                )
             )
             kernel_kwargs["has_tail"] = not full_chunks_only
+            kernel_kwargs["seq_parts"] = seq_parts
+            if seq_parts > 1:
+                gate_cp_states = torch.empty(
+                    (
+                        batch_size,
+                        seq_parts - 1,
+                        num_heads_v,
+                        HEAD_DIM_K,
+                        HEAD_DIM_V,
+                    ),
+                    dtype=torch.float32,
+                    device=v.device,
+                )
+                gate_cp_warmup_counts = torch.empty(
+                    (batch_size, seq_parts - 1, num_heads_v),
+                    dtype=torch.int32,
+                    device=v.device,
+                )
+                gate_cp_warmup = tilelang_get_gate_cp_warmup(
+                    num_heads_v,
+                    gate_dtype=g_cumsum.dtype,
+                    seq_parts=seq_parts,
+                    gate_threshold=GATE_CP_THRESHOLD,
+                )
+                gate_cp_prepare = tilelang_prepare_gate_cp_states(
+                    num_heads_v,
+                    num_heads_qk,
+                    qk_dtype=q.dtype,
+                    v_dtype=v.dtype,
+                    gate_dtype=g_cumsum.dtype,
+                    accum_dtype="float32",
+                    use_initial_state=use_initial_state,
+                    dv_tile=dv_tile,
+                    dv_parts=dv_parts,
+                    seq_parts=seq_parts,
+                )
         recurrent = kernel_factory(
             num_heads_v,
             num_heads_qk,
@@ -632,16 +750,49 @@ def gdn_prefill_forward(
             dv_parts=dv_parts,
             prefetch_k=prefetch_k,
         )
-    recurrent(
-        q,
-        k,
-        v,
-        g_cumsum,
-        beta,
-        A,
-        initial_state,
-        output,
-        final_state,
-        chunks_per_batch,
-    )
+    if gate_cp_warmup is not None:
+        gate_cp_warmup(
+            g_cumsum,
+            gate_cp_warmup_counts,
+            chunks_per_batch,
+        )
+    if gate_cp_prepare is not None:
+        gate_cp_prepare(
+            k,
+            v,
+            g_cumsum,
+            beta,
+            A,
+            initial_state,
+            gate_cp_warmup_counts,
+            gate_cp_states,
+            chunks_per_batch,
+        )
+    if use_rs:
+        recurrent(
+            q,
+            k,
+            v,
+            g_cumsum,
+            beta,
+            A,
+            initial_state,
+            gate_cp_states,
+            output,
+            final_state,
+            chunks_per_batch,
+        )
+    else:
+        recurrent(
+            q,
+            k,
+            v,
+            g_cumsum,
+            beta,
+            A,
+            initial_state,
+            output,
+            final_state,
+            chunks_per_batch,
+        )
     return output, final_state

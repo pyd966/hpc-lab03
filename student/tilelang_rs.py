@@ -14,6 +14,306 @@ LOG2E = 1.4426950408889634
 SCALE = HEAD_DIM_K**-0.5
 
 
+@tilelang.jit()
+def tilelang_get_gate_cp_warmup(
+    H,
+    gate_dtype,
+    seq_parts,
+    gate_threshold,
+):
+    """Count the gate-decayed warmup suffix for every nonzero CP slice."""
+    batch_size = T.dynamic("batch_size")
+    num_tokens = T.dynamic("num_tokens")
+    gate_shape = (batch_size, num_tokens, H)
+    warmup_shape = (batch_size, seq_parts - 1, H)
+    num_threads = tilelang.cdiv(H, 32) * 32
+
+    @T.prim_func
+    def kernel(
+        g: T.Tensor(gate_shape, dtype=gate_dtype),
+        warmup_counts: T.Tensor(warmup_shape, dtype="int32"),
+        chunks_per_batch: T.int32,
+    ):
+        T.func_attr(
+            {"global_symbol": "get_gate_cp_warmup_sp" + str(seq_parts)}
+        )
+        with T.Kernel(
+            batch_size * (seq_parts - 1), threads=num_threads
+        ) as (block,):
+            bb = block // (seq_parts - 1)
+            seq_part = block % (seq_parts - 1) + 1
+            target_begin = seq_part * (chunks_per_batch // seq_parts)
+
+            gate_value = T.alloc_fragment((H,), dtype="float32")
+            gate_sum = T.alloc_fragment((H,), dtype="float32")
+            warmup_fragment = T.alloc_fragment((H,), dtype="int32")
+            T.clear(gate_sum)
+            T.fill(warmup_fragment, target_begin)
+
+            for offset in T.serial(target_begin):
+                for bh in T.Parallel(H):
+                    gate_value[bh] = g[
+                        bb,
+                        (target_begin - offset) * CHUNK_SIZE - 1,
+                        bh,
+                    ]
+                for bh in T.Parallel(H):
+                    gate_sum[bh] += gate_value[bh]
+                for bh in T.Parallel(H):
+                    if (
+                        gate_sum[bh] < gate_threshold
+                        and warmup_fragment[bh] == target_begin
+                    ):
+                        warmup_fragment[bh] = offset + 1
+
+            for bh in T.Parallel(H):
+                warmup_counts[bb, seq_part - 1, bh] = warmup_fragment[bh]
+
+    return kernel
+
+
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    },
+)
+def tilelang_prepare_gate_cp_states(
+    H,
+    Hg,
+    qk_dtype,
+    v_dtype,
+    gate_dtype,
+    accum_dtype,
+    use_initial_state,
+    dv_tile,
+    dv_parts,
+    seq_parts,
+):
+    """Prepare an independently runnable initial state for each CP slice."""
+    batch_size = T.dynamic("batch_size")
+    num_tokens = T.dynamic("num_tokens")
+    qk_shape = (batch_size, num_tokens, Hg, HEAD_DIM_K)
+    v_shape = (batch_size, num_tokens, H, HEAD_DIM_V)
+    gate_shape = (batch_size, num_tokens, H)
+    a_shape = (batch_size, num_tokens, H, CHUNK_SIZE)
+    state_shape = (batch_size, H, HEAD_DIM_K, HEAD_DIM_V)
+    initial_shape = state_shape if use_initial_state else (1,)
+    cp_state_shape = (
+        batch_size,
+        seq_parts - 1,
+        H,
+        HEAD_DIM_K,
+        HEAD_DIM_V,
+    )
+    warmup_shape = (batch_size, seq_parts - 1, H)
+    value_threads = 128 if dv_tile == 64 else 256
+    value_row_warps = value_threads // 32
+    project_rs = WGMMAEmitter(
+        a_dtype="bfloat16",
+        b_dtype="bfloat16",
+        accum_dtype="float32",
+        b_transposed=True,
+        block_row_warps=value_row_warps,
+        block_col_warps=1,
+        warp_row_tiles=16,
+        warp_col_tiles=64,
+        chunk=HEAD_DIM_K,
+    )
+    correction_rs = WGMMAEmitter(
+        a_dtype="bfloat16",
+        b_dtype="bfloat16",
+        accum_dtype="float32",
+        b_transposed=True,
+        block_row_warps=value_row_warps,
+        block_col_warps=1,
+        warp_row_tiles=16,
+        warp_col_tiles=64,
+        chunk=CHUNK_SIZE,
+    )
+    update_rs = WGMMAEmitter(
+        a_dtype="bfloat16",
+        b_dtype="bfloat16",
+        accum_dtype="float32",
+        block_row_warps=value_row_warps,
+        block_col_warps=1,
+        warp_row_tiles=16,
+        warp_col_tiles=128,
+        chunk=CHUNK_SIZE,
+    )
+    kernel_name = (
+        "prepare_gate_cp_dv"
+        + str(dv_tile)
+        + "x"
+        + str(dv_parts)
+        + "_sp"
+        + str(seq_parts)
+    )
+
+    @T.prim_func
+    def kernel(
+        k: T.Tensor(qk_shape, dtype=qk_dtype),
+        v: T.Tensor(v_shape, dtype=v_dtype),
+        g: T.Tensor(gate_shape, dtype=gate_dtype),
+        beta: T.Tensor(gate_shape, dtype=gate_dtype),
+        a: T.Tensor(a_shape, dtype=qk_dtype),
+        initial_state: T.Tensor(initial_shape, dtype=accum_dtype),
+        warmup_counts: T.Tensor(warmup_shape, dtype="int32"),
+        cp_states: T.Tensor(cp_state_shape, dtype=accum_dtype),
+        chunks_per_batch: T.int32,
+    ):
+        T.func_attr({"global_symbol": kernel_name})
+        base_blocks = batch_size * H * dv_parts
+        with T.Kernel(
+            base_blocks * (seq_parts - 1), threads=value_threads
+        ) as (block,):
+            seq_part = block // base_blocks + 1
+            value_block = block % base_blocks
+            owner = value_block // dv_parts
+            dv_part = value_block % dv_parts
+            bb = owner // H
+            bh = owner % H
+            bhg = bh // (H // Hg)
+            dv_left = dv_part * dv_tile
+            target_begin = seq_part * (chunks_per_batch // seq_parts)
+
+            k_shared = T.alloc_shared(
+                (CHUNK_SIZE, HEAD_DIM_K), dtype=qk_dtype
+            )
+            v_shared = T.alloc_shared((CHUNK_SIZE, dv_tile), dtype=v_dtype)
+            a_shared = T.alloc_shared(
+                (CHUNK_SIZE, CHUNK_SIZE), dtype=qk_dtype
+            )
+            g_shared = T.alloc_shared((CHUNK_SIZE,), dtype=gate_dtype)
+            gamma_shared = T.alloc_shared((CHUNK_SIZE,), dtype=gate_dtype)
+            inv_gamma_shared = T.alloc_shared(
+                (CHUNK_SIZE,), dtype=gate_dtype
+            )
+            beta_shared = T.alloc_shared((CHUNK_SIZE,), dtype=gate_dtype)
+            gamma_last = T.alloc_shared((1,), dtype=gate_dtype)
+
+            state_t = T.alloc_fragment(
+                (dv_tile, HEAD_DIM_K), dtype=accum_dtype
+            )
+            state_operand = T.alloc_fragment(
+                (dv_tile, HEAD_DIM_K), dtype=v_dtype
+            )
+            z_operand = T.alloc_fragment(
+                (dv_tile, CHUNK_SIZE), dtype=v_dtype
+            )
+            z_t = T.alloc_fragment(
+                (dv_tile, CHUNK_SIZE), dtype=accum_dtype
+            )
+
+            k_layout = make_full_bank_swizzled_layout(k_shared)
+            v_layout = make_full_bank_swizzled_layout(v_shared)
+            a_layout = make_full_bank_swizzled_layout(a_shared)
+            T.annotate_layout(
+                {
+                    k_shared: k_layout,
+                    v_shared: v_layout,
+                    a_shared: a_layout,
+                    state_operand: project_rs.make_mma_load_layout(
+                        state_operand
+                    ),
+                    z_operand: correction_rs.make_mma_load_layout(z_operand),
+                    z_t: project_rs.make_mma_store_layout(z_t),
+                    state_t: update_rs.make_mma_store_layout(state_t),
+                }
+            )
+            project_rs._assign_b_shared_layout(k_layout)
+            correction_rs._assign_b_shared_layout(a_layout)
+            update_rs._assign_b_shared_layout(k_layout)
+
+            warmup_count = T.alloc_var("int32")
+            warmup_start = T.alloc_var("int32")
+            warmup_count = warmup_counts[bb, seq_part - 1, bh]
+            warmup_start = target_begin - warmup_count
+
+            T.clear(state_t)
+            if use_initial_state:
+                if warmup_start == 0:
+                    for dim_v, dim_k in T.Parallel(dv_tile, HEAD_DIM_K):
+                        state_t[dim_v, dim_k] = initial_state[
+                            bb, bh, dim_k, dv_left + dim_v
+                        ]
+
+            for local_chunk in T.serial(warmup_count):
+                chunk = warmup_start + local_chunk
+                left = chunk * CHUNK_SIZE
+                right = left + CHUNK_SIZE
+                T.copy(k[bb, left:right, bhg, 0:HEAD_DIM_K], k_shared)
+                T.copy(
+                    v[
+                        bb,
+                        left:right,
+                        bh,
+                        dv_left : dv_left + dv_tile,
+                    ],
+                    v_shared,
+                )
+                T.copy(a[bb, left:right, bh, 0:CHUNK_SIZE], a_shared)
+                T.copy(g[bb, left:right, bh], g_shared)
+                T.copy(beta[bb, left:right, bh], beta_shared)
+
+                T.copy(state_t, state_operand)
+                project_rs.wgmma(
+                    state_operand[0:dv_tile, 0:HEAD_DIM_K],
+                    k_shared[0:CHUNK_SIZE, 0:HEAD_DIM_K],
+                    z_t[0:dv_tile, 0:CHUNK_SIZE],
+                    clear_accum=True,
+                    wg_wait=-1,
+                )
+                for token in T.Parallel(CHUNK_SIZE):
+                    gamma_shared[token] = T.exp2(
+                        g_shared[token] * LOG2E
+                    )
+                    inv_gamma_shared[token] = 1.0 / gamma_shared[token]
+                    if token == CHUNK_SIZE - 1:
+                        gamma_last[0] = gamma_shared[token]
+                for dim_v, dim_k in T.Parallel(dv_tile, HEAD_DIM_K):
+                    state_t[dim_v, dim_k] *= gamma_last[0]
+
+                T.warpgroup_wait(0)
+                for dim_v, token in T.Parallel(dv_tile, CHUNK_SIZE):
+                    z_t[dim_v, token] = beta_shared[token] * (
+                        v_shared[token, dim_v]
+                        - gamma_shared[token] * z_t[dim_v, token]
+                    )
+                T.copy(z_t, z_operand)
+                correction_rs.wgmma(
+                    z_operand[0:dv_tile, 0:CHUNK_SIZE],
+                    a_shared[0:CHUNK_SIZE, 0:CHUNK_SIZE],
+                    z_t[0:dv_tile, 0:CHUNK_SIZE],
+                    clear_accum=True,
+                    wg_wait=-1,
+                )
+                T.warpgroup_wait(0)
+                for dim_v, token in T.Parallel(dv_tile, CHUNK_SIZE):
+                    z_t[dim_v, token] *= (
+                        gamma_last[0] * inv_gamma_shared[token]
+                    )
+                T.copy(z_t, z_operand)
+                update_rs.wgmma(
+                    z_operand[0:dv_tile, 0:CHUNK_SIZE],
+                    k_shared[0:CHUNK_SIZE, 0:HEAD_DIM_K],
+                    state_t[0:dv_tile, 0:HEAD_DIM_K],
+                    clear_accum=False,
+                    wg_wait=-1,
+                )
+                T.warpgroup_wait(0)
+
+            for dim_v, dim_k in T.Parallel(dv_tile, HEAD_DIM_K):
+                cp_states[
+                    bb,
+                    seq_part - 1,
+                    bh,
+                    dim_k,
+                    dv_left + dim_v,
+                ] = state_t[dim_v, dim_k]
+
+    return kernel
+
+
 @tilelang.jit(
     pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
@@ -35,6 +335,7 @@ def tilelang_residual_first_full_chunks_rs(
     prefetch_a,
     reuse_output_shared,
     has_tail,
+    seq_parts,
 ):
     """RS WGMMA path with a pipelined full prefix and one predicated tail."""
     batch_size = T.dynamic("batch_size")
@@ -45,6 +346,17 @@ def tilelang_residual_first_full_chunks_rs(
     a_shape = (batch_size, num_tokens, H, CHUNK_SIZE)
     state_shape = (batch_size, H, HEAD_DIM_K, HEAD_DIM_V)
     initial_shape = state_shape if use_initial_state else (1,)
+    cp_state_shape = (
+        (
+            batch_size,
+            seq_parts - 1,
+            H,
+            HEAD_DIM_K,
+            HEAD_DIM_V,
+        )
+        if seq_parts > 1
+        else initial_shape
+    )
     q_stage = 0 if prefetch_q else 1
     k_stage = 0 if prefetch_k else 1
     v_stage = 0 if prefetch_v else 1
@@ -83,6 +395,7 @@ def tilelang_residual_first_full_chunks_rs(
         + prefetch_tag
         + ("_reuse_so" if reuse_output_shared else "")
         + ("_tail" if has_tail else "")
+        + ("_cp" + str(seq_parts) if seq_parts > 1 else "")
     )
 
     # Hopper WGMMA always covers 64 rows. Dispatch keeps D=32 on the SS path.
@@ -142,16 +455,27 @@ def tilelang_residual_first_full_chunks_rs(
         beta: T.Tensor(gate_shape, dtype=gate_dtype),
         a: T.Tensor(a_shape, dtype=qk_dtype),
         initial_state: T.Tensor(initial_shape, dtype=accum_dtype),
+        cp_states: T.Tensor(cp_state_shape, dtype=accum_dtype),
         output: T.Tensor(v_shape, dtype=v_dtype),
         final_state: T.Tensor(state_shape, dtype=accum_dtype),
         chunks_per_batch: T.int32,
     ):
         T.func_attr({"global_symbol": kernel_name})
-        with T.Kernel(batch_size * H * dv_parts, threads=value_threads) as (block,):
+        base_blocks = batch_size * H * dv_parts
+        with T.Kernel(
+            base_blocks * seq_parts, threads=value_threads
+        ) as (block,):
             if reuse_output_shared:
                 T.annotate_min_blocks_per_sm(2)
-            owner = block // dv_parts
-            dv_part = block % dv_parts
+            if seq_parts > 1:
+                seq_part = block // base_blocks
+                value_block = block % base_blocks
+                owner = value_block // dv_parts
+                dv_part = value_block % dv_parts
+            else:
+                seq_part = 0
+                owner = block // dv_parts
+                dv_part = block % dv_parts
             bb = owner // H
             bh = owner % H
             bhg = bh // (H // Hg)
@@ -250,20 +574,37 @@ def tilelang_residual_first_full_chunks_rs(
             score_ss._assign_b_shared_layout(k_layout)
 
             T.clear(state_t)
-            if use_initial_state:
+            if seq_parts > 1 and seq_part > 0:
+                for dim_v, dim_k in T.Parallel(dv_tile, HEAD_DIM_K):
+                    state_t[dim_v, dim_k] = cp_states[
+                        bb,
+                        seq_part - 1,
+                        bh,
+                        dim_k,
+                        dv_left + dim_v,
+                    ]
+            elif use_initial_state:
                 for dim_v, dim_k in T.Parallel(dv_tile, HEAD_DIM_K):
                     state_t[dim_v, dim_k] = initial_state[
                         bb, bh, dim_k, dv_left + dim_v
                     ]
 
-            pipelined_chunks = (
-                num_tokens // CHUNK_SIZE if has_tail else chunks_per_batch
-            )
-            for chunk in T.Pipelined(
+            if seq_parts > 1:
+                pipelined_chunks = chunks_per_batch // seq_parts
+                chunk_begin = seq_part * pipelined_chunks
+            else:
+                pipelined_chunks = (
+                    num_tokens // CHUNK_SIZE
+                    if has_tail
+                    else chunks_per_batch
+                )
+                chunk_begin = 0
+            for local_chunk in T.Pipelined(
                 pipelined_chunks,
                 order=pipeline_order,
                 stage=pipeline_stage,
             ):
+                chunk = chunk_begin + local_chunk
                 left = chunk * CHUNK_SIZE
                 right = left + CHUNK_SIZE
 
@@ -517,9 +858,10 @@ def tilelang_residual_first_full_chunks_rs(
                         ] = out_t[dim_v, token]
                 T.warpgroup_wait(0)
 
-            for dim_v, dim_k in T.Parallel(dv_tile, HEAD_DIM_K):
-                final_state[bb, bh, dim_k, dv_left + dim_v] = state_t[
-                    dim_v, dim_k
-                ]
+            if seq_part == seq_parts - 1:
+                for dim_v, dim_k in T.Parallel(dv_tile, HEAD_DIM_K):
+                    final_state[bb, bh, dim_k, dv_left + dim_v] = state_t[
+                        dim_v, dim_k
+                    ]
 
     return kernel
