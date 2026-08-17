@@ -27,7 +27,7 @@ PREFETCH_MODE = os.environ.get("GDN_PREFETCH", "auto")
 MEMORY_IO_MODE = os.environ.get("GDN_MEMORY_IO", "auto")
 GATE_CP_MODE = os.environ.get("GDN_GATE_CP", "auto")
 GATE_CP_THRESHOLD = float(os.environ.get("GDN_GATE_CP_THRESHOLD", "-10.0"))
-GATE_CP_MIN_CHUNKS = int(os.environ.get("GDN_GATE_CP_MIN_CHUNKS", "128"))
+GATE_CP_MIN_CHUNKS = int(os.environ.get("GDN_GATE_CP_MIN_CHUNKS", "64"))
 DV_SPLIT_CONFIGS = {
     "off": (HEAD_DIM_V, 1),
     "64": (64, 2),
@@ -524,12 +524,13 @@ def _select_gate_cp_parts(
     rs_available,
     base_blocks,
     blocks_per_sm,
+    num_heads_qk,
+    num_heads_v,
     chunks_per_batch,
 ):
     """Choose power-of-two sequence parallelism from occupancy and chain length."""
     if (
         GATE_CP_MODE == "off"
-        or batch_size != 1
         or not full_chunks_only
         or not rs_available
     ):
@@ -537,26 +538,66 @@ def _select_gate_cp_parts(
 
     if GATE_CP_MODE in ("auto", "on"):
         resident_slots = MIG_SM_COUNT * blocks_per_sm
-        if (
-            base_blocks >= resident_slots
-            or chunks_per_batch < GATE_CP_MIN_CHUNKS
-        ):
+        if chunks_per_batch < GATE_CP_MIN_CHUNKS:
             return 1
-        # FlashQLA's latency model minimizes
-        #   local_chunks + total_block_chunks / (slots * local_chunks).
-        # The empirical factor 3 and power-of-two rounding follow upstream;
-        # resident_slots is adapted to this 14-SM MIG and our CTA resources.
-        estimated_local_chunks = 3.0 * math.sqrt(
-            base_blocks * chunks_per_batch / resident_slots
-        )
-        local_chunks = 2 ** round(math.log2(estimated_local_chunks))
-        local_chunks = max(local_chunks, 4)
-        seq_parts = 1
-        while (
-            seq_parts < 8
-            and chunks_per_batch // seq_parts > local_chunks
-        ):
-            seq_parts *= 2
+
+        if blocks_per_sm == 2:
+            # D64 CP uses compact shared memory and can place two CTAs on an
+            # SM. Round local work up so boundary points prefer fewer parts.
+            estimated_local_chunks = 3.0 * math.sqrt(
+                base_blocks * chunks_per_batch / resident_slots
+            )
+            local_chunks = 2 ** math.ceil(
+                math.log2(estimated_local_chunks)
+            )
+            local_chunks = max(local_chunks, 4)
+            seq_parts = 1
+            while (
+                seq_parts < 8
+                and chunks_per_batch // seq_parts > local_chunks
+            ):
+                seq_parts *= 2
+        else:
+            # D128 remains one CTA/SM. Compare main, preparation, and scalar
+            # scan wave costs in equivalent main-kernel chunk units.
+            base_cost = chunks_per_batch * math.ceil(
+                base_blocks / resident_slots
+            )
+            candidate_costs = {1: base_cost}
+            prepare_chunk_equivalent = 15.0
+            scan_chunk_fraction = 0.05
+            qk_reuse_fraction = max(
+                0.0, 1.0 - num_heads_qk / num_heads_v
+            )
+            qk_reuse_bonus = (
+                scan_chunk_fraction
+                * chunks_per_batch
+                * qk_reuse_fraction
+            )
+            for candidate_parts in (2, 4, 8):
+                if chunks_per_batch % candidate_parts != 0:
+                    continue
+                main_waves = math.ceil(
+                    base_blocks * candidate_parts / resident_slots
+                )
+                prepare_waves = math.ceil(
+                    base_blocks * (candidate_parts - 1) / resident_slots
+                )
+                main_cost = (
+                    chunks_per_batch * main_waves / candidate_parts
+                )
+                prepare_cost = prepare_chunk_equivalent * prepare_waves
+                scan_cost = (
+                    scan_chunk_fraction
+                    * chunks_per_batch
+                    * (candidate_parts - 1)
+                    / candidate_parts
+                )
+                candidate_costs[candidate_parts] = (
+                    main_cost + prepare_cost + scan_cost - qk_reuse_bonus
+                )
+            seq_parts = min(candidate_costs, key=candidate_costs.get)
+
         # Keep equal static slices; unsupported divisibility falls back by
         # powers of two instead of adding a second tail specialization.
         while seq_parts > 1 and chunks_per_batch % seq_parts != 0:
@@ -663,6 +704,8 @@ def gdn_prefill_forward(
             rs_available=use_rs,
             base_blocks=state_owners * dv_parts,
             blocks_per_sm=2 if dv_tile == 64 else 1,
+            num_heads_qk=num_heads_qk,
+            num_heads_v=num_heads_v,
             chunks_per_batch=chunks_per_batch,
         )
         kernel_factory = (
