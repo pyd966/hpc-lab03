@@ -27,7 +27,7 @@ PREFETCH_MODE = os.environ.get("GDN_PREFETCH", "auto")
 MEMORY_IO_MODE = os.environ.get("GDN_MEMORY_IO", "auto")
 GATE_CP_MODE = os.environ.get("GDN_GATE_CP", "auto")
 GATE_CP_THRESHOLD = float(os.environ.get("GDN_GATE_CP_THRESHOLD", "-10.0"))
-GATE_CP_MIN_CHUNKS = int(os.environ.get("GDN_GATE_CP_MIN_CHUNKS", "64"))
+GATE_CP_MIN_CHUNKS = int(os.environ.get("GDN_GATE_CP_MIN_CHUNKS", "128"))
 DV_SPLIT_CONFIGS = {
     "off": (HEAD_DIM_V, 1),
     "64": (64, 2),
@@ -538,7 +538,10 @@ def _select_gate_cp_parts(
 
     if GATE_CP_MODE in ("auto", "on"):
         resident_slots = MIG_SM_COUNT * blocks_per_sm
-        if chunks_per_batch < GATE_CP_MIN_CHUNKS:
+        if (
+            base_blocks >= resident_slots
+            or chunks_per_batch < GATE_CP_MIN_CHUNKS
+        ):
             return 1
 
         if blocks_per_sm == 2:
